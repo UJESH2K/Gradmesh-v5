@@ -1,20 +1,11 @@
-# NVIDIA training plane, CUDA 12.8 build, for Blackwell and newer.
+# NVIDIA training plane, CUDA 12.8 build. Fallback only.
 #
-# Compute capability 12.0 hardware, which is the RTX 50 series and the B-series
-# datacentre parts, has no kernels in any cu12.1 wheel. PyTorch only gained
-# sm_120 in the 2.7 line built against CUDA 12.8.
-#
-# Older cards should use requirements-train-cu121.txt instead: this build drops
-# some of the oldest architectures, and there is no reason to move a working
-# Ampere machine onto it. Setup picks between the two from the compute
-# capability reported by nvidia-smi.
+# Used for a Blackwell card (RTX 50 series) whose driver is R570 to R579: new
+# enough for CUDA 12.8, too old for CUDA 13.0. PyTorch stopped publishing cu128
+# wheels at 2.11, so a machine on this file is NOT on the reference stack and
+# its results are flagged as such. Updating the driver to R580 or newer moves
+# it onto requirements-train-cu130.txt at the next setup.
 --extra-index-url https://download.pytorch.org/whl/cu128
--r requirements-control.txt
-torch==2.7.1+cu128
-torchvision==0.22.1+cu128
-ultralytics==8.4.46
-numpy
-opencv-python
-scipy
-# Figures for the benchmark report.
-matplotlib>=3.8
+-r requirements-common.txt
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128

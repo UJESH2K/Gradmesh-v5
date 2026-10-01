@@ -1,36 +1,41 @@
 /**
- * One-time environment setup, run automatically by `npm run dev`.
+ * Environment setup, run automatically by `npm run dev` and by `npm run setup`.
  *
- * v3 asked every participant to create a virtualenv by hand, pick the right
- * requirements file for their GPU vendor, and download a checkpoint before
- * anything worked. That is the single biggest reason a demo failed. This script
- * does all of it, is safe to run repeatedly, and separates the fast control
- * plane from the slow training plane so the dashboard is usable in seconds
- * while torch downloads in the background.
+ * The work happens in engine/setup_env.py, which the one-line join flow also
+ * uses, so a host and a contributor are set up by the same code: it repairs or
+ * rebuilds an environment that came from another machine, picks the PyTorch
+ * build from the GPU and driver, retries downloads, and proves the accelerator
+ * runs a kernel before calling anything ready. This file finds a Python to run
+ * it with, splits the fast control plane from the slow training plane so the
+ * dashboard is usable in seconds, and fetches the base checkpoints.
+ *
+ *   npm run setup                       everything, verbose
+ *   npm run setup -- --control-only     just the coordinator runtime
+ *   npm run setup -- --force            reinstall even if nothing changed
+ *   npm run setup -- --backend xpu      override the detected backend
+ *   npm run setup -- --wheelhouse DIR   install from pre-downloaded wheels
  */
 
 import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { rm, stat } from "node:fs/promises";
+import { rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { spawn } from "node:child_process";
 
 import {
   ENGINE_DIR,
+  PATHS,
   REPO_ROOT,
   STATE_DIR,
   VENV_DIR,
-  detectGpuProfile,
   ensureStateDir,
-  findSystemPython,
   log,
   paint,
-  run,
-  venvPython,
-  venvReady,
+  requireSystemPython,
 } from "./lib/env.mjs";
 
-const SETUP_FILE = path.join(STATE_DIR, "setup.json");
+const SETUP_FILE = PATHS.setupState;
 const MODELS_DIR = path.join(STATE_DIR, "models");
 
 const BASE_MODELS = [
@@ -44,66 +49,103 @@ const BASE_MODELS = [
   },
 ];
 
+const EMPTY_STATE = { controlPlane: "pending", trainingPlane: "pending", models: [], backend: null, messages: [] };
+
 export function readSetupState() {
-  if (!existsSync(SETUP_FILE)) {
-    return { controlPlane: "pending", trainingPlane: "pending", models: [], backend: null, messages: [] };
-  }
+  if (!existsSync(SETUP_FILE)) return { ...EMPTY_STATE };
   try {
-    return JSON.parse(readFileSync(SETUP_FILE, "utf8"));
+    return { ...EMPTY_STATE, ...JSON.parse(readFileSync(SETUP_FILE, "utf8")) };
   } catch {
-    return { controlPlane: "pending", trainingPlane: "pending", models: [], backend: null, messages: [] };
+    return { ...EMPTY_STATE };
   }
 }
 
 export function writeSetupState(patch) {
-  ensureStateDir();
+  mkdirSync(path.dirname(SETUP_FILE), { recursive: true });
   const next = { ...readSetupState(), ...patch, updatedAt: Date.now() };
   writeFileSync(SETUP_FILE, JSON.stringify(next, null, 2));
   return next;
 }
 
-function note(message) {
-  const state = readSetupState();
-  const messages = [...(state.messages || []), { at: Date.now(), message }].slice(-40);
-  writeSetupState({ messages });
+function cliOptions(argv = process.argv.slice(2)) {
+  const value = (flag) => {
+    const index = argv.indexOf(flag);
+    return index !== -1 && argv[index + 1] && !argv[index + 1].startsWith("--") ? argv[index + 1] : null;
+  };
+  return {
+    controlOnly: argv.includes("--control-only"),
+    force: argv.includes("--force"),
+    backend: value("--backend") || process.env.GRADMESH_BACKEND || "auto",
+    wheelhouse: value("--wheelhouse") || process.env.GRADMESH_WHEELHOUSE || null,
+  };
 }
 
-async function ensureVenv() {
-  if (venvReady()) return;
-
-  const python = findSystemPython();
-  if (!python) {
-    console.error(
-      paint(
-        "red",
-        "\nGradMesh needs Python 3.9 or newer on PATH.\n" +
-          "  Windows: winget install Python.Python.3.12\n" +
-          "  macOS:   brew install python@3.12\n" +
-          "  Linux:   sudo apt install python3 python3-venv\n"
-      )
+/** Run engine/setup_env.py with the system Python. Resolves to its exit code. */
+function setupEnv(args, { quiet = false } = {}) {
+  const python = requireSystemPython();
+  mkdirSync(PATHS.machineDir, { recursive: true });
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      python.command,
+      [...python.args, path.join(ENGINE_DIR, "setup_env.py"), ...args],
+      {
+        cwd: ENGINE_DIR,
+        stdio: quiet ? ["ignore", "pipe", "pipe"] : "inherit",
+        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+        windowsHide: true,
+      }
     );
-    process.exit(1);
-  }
-
-  log("setup", `creating a virtual environment with Python ${python.version}`);
-  await run(python.command, [...python.args, "-m", "venv", VENV_DIR]);
+    if (quiet) {
+      // Background installs keep a full log next to the setup state, so a
+      // failure the dashboard reports can actually be read.
+      const logFile = createWriteStream(PATHS.setupLog, { flags: "a" });
+      logFile.write(`\n# ${new Date().toISOString()} setup_env.py ${args.join(" ")}\n`);
+      child.stdout.pipe(logFile, { end: false });
+      child.stderr.pipe(logFile, { end: false });
+      child.on("close", () => logFile.end());
+    }
+    child.on("error", reject);
+    child.on("close", (code) => resolve(code ?? 1));
+  });
 }
 
-async function pipInstall(requirementsFile, label) {
-  const python = venvPython();
-  log("setup", `installing ${label}`);
-  await run(python, ["-m", "pip", "install", "--upgrade", "pip", "--quiet", "--disable-pip-version-check"], {
-    allowFailure: true,
-  });
-  await run(python, [
-    "-m",
-    "pip",
-    "install",
-    "--quiet",
-    "--disable-pip-version-check",
-    "-r",
-    path.join(ENGINE_DIR, requirementsFile),
-  ]);
+function sharedArgs(options) {
+  const args = ["--venv", VENV_DIR, "--state", SETUP_FILE];
+  if (options.backend && options.backend !== "auto") args.push("--backend", options.backend);
+  if (options.wheelhouse) args.push("--wheelhouse", options.wheelhouse);
+  if (options.force) args.push("--force");
+  return args;
+}
+
+export async function setupControlPlane(options = cliOptions()) {
+  ensureStateDir();
+  if (PATHS.synced) {
+    log("setup", `this folder syncs to other devices, so its Python environment lives at ${VENV_DIR}`, "gray");
+  }
+  const code = await setupEnv(["install", "--plane", "control", ...sharedArgs(options)]);
+  if (code !== 0) {
+    throw new Error("the coordinator runtime could not be installed; the output above has the cause");
+  }
+}
+
+export async function setupTrainingPlane({ quiet = false, ...rest } = {}) {
+  const options = { ...cliOptions(), ...rest };
+  if (!quiet) log("setup", "installing the training plane, PyTorch is a large download the first time");
+  const code = await setupEnv(
+    ["install", "--plane", "training", "--host", ...sharedArgs(options), ...(quiet ? ["--quiet"] : [])],
+    { quiet }
+  );
+  const state = readSetupState();
+  if (code !== 0 && state.trainingPlane !== "failed") {
+    writeSetupState({ trainingPlane: "failed", trainingError: `setup exited with code ${code}` });
+  }
+  if (!quiet) {
+    if (code === 0 && state.accelerator === "ok") log("setup", "training plane ready", "green");
+    else if (code === 0) {
+      log("setup", `training plane ready, but: ${state.acceleratorProblem || "the GPU check failed"}`, "yellow");
+    } else log("setup", `training plane install failed, see ${PATHS.setupLog}`, "red");
+  }
+  return code;
 }
 
 async function downloadModels() {
@@ -122,16 +164,20 @@ async function downloadModels() {
     }
 
     log("setup", `downloading ${model.name}`);
+    const partial = `${target}.part`;
     try {
-      const response = await fetch(model.url, { redirect: "follow" });
+      const response = await fetch(model.url, { redirect: "follow", signal: AbortSignal.timeout(180000) });
       if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
-      await pipeline(Readable.fromWeb(response.body), createWriteStream(target));
+      // Written beside the target and renamed, so an interrupted download can
+      // never leave a truncated checkpoint that later looks present.
+      await pipeline(Readable.fromWeb(response.body), createWriteStream(partial));
+      await rename(partial, target);
       present.push(model.name);
     } catch (error) {
       // A checkpoint is only needed when a run starts, so a flaky network at
       // setup time must not stop the dashboard from coming up.
       log("setup", `could not fetch ${model.name}: ${error.message}`, "yellow");
-      await rm(target, { force: true });
+      await rm(partial, { force: true });
     }
   }
 
@@ -139,67 +185,22 @@ async function downloadModels() {
   return present;
 }
 
-/**
- * Requirements profile for whatever accelerator this machine actually has.
- *
- * Chosen from the GPU's compute capability, not its name, because a CUDA wheel
- * only carries kernels for the architectures it was compiled against. See
- * detectGpuProfile for why that distinction is load-bearing.
- */
-export function trainingRequirements() {
-  return detectGpuProfile();
-}
-
-export async function setupControlPlane() {
-  ensureStateDir();
-  await ensureVenv();
-  writeSetupState({ controlPlane: "installing" });
-  await pipInstall("requirements-control.txt", "the coordinator runtime");
-  writeSetupState({ controlPlane: "ready" });
-  note("Control plane ready.");
-}
-
-export async function setupTrainingPlane({ quiet = false } = {}) {
-  const profile = trainingRequirements();
-  writeSetupState({
-    trainingPlane: "installing",
-    backend: profile.backend,
-    gpu: profile.name,
-    computeCapability: profile.capability,
-    profile: profile.profile,
-    profileReason: profile.reason,
-  });
-  if (!quiet) {
-    log("setup", `${profile.name}: ${profile.reason}`);
-    log("setup", `installing ${profile.label}, this can take a few minutes`);
-  }
-  note(`Installing ${profile.label}.`);
-  try {
-    await pipInstall(profile.file, profile.label);
-    writeSetupState({ trainingPlane: "ready" });
-    note("Training plane ready. Runs can start now.");
-    if (!quiet) log("setup", "training plane ready", "green");
-  } catch (error) {
-    writeSetupState({ trainingPlane: "failed", trainingError: String(error.message || error) });
-    note(`Training plane install failed: ${error.message}`);
-    if (!quiet) log("setup", `training plane install failed: ${error.message}`, "red");
-  }
-}
-
 async function main() {
-  const args = new Set(process.argv.slice(2));
-  await setupControlPlane();
+  const options = cliOptions();
+  await setupControlPlane(options);
   await downloadModels();
 
-  if (!args.has("--control-only")) {
-    await setupTrainingPlane();
-  }
+  let code = 0;
+  if (!options.controlOnly) code = await setupTrainingPlane({ ...options, quiet: false });
 
   const state = readSetupState();
-  log("setup", "done", "green");
+  log("setup", code === 0 ? "done" : "finished with problems", code === 0 ? "green" : "yellow");
   console.log(
-    `${paint("gray", "           ")} control plane: ${state.controlPlane}, training plane: ${state.trainingPlane}, models: ${(state.models || []).join(", ") || "none"}`
+    `${paint("gray", "           ")} control plane: ${state.controlPlane}, training plane: ${state.trainingPlane}` +
+      `${state.torch ? ` (torch ${state.torch})` : ""}, models: ${(state.models || []).join(", ") || "none"}`
   );
+  console.log(`${paint("gray", "           ")} environment: ${VENV_DIR}`);
+  process.exit(code);
 }
 
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("bootstrap.mjs")) {

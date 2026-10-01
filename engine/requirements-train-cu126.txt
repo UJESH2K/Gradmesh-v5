@@ -1,0 +1,11 @@
+# NVIDIA training plane, CUDA 12.6 build.
+#
+# For Maxwell through Hopper (compute capability 5.0 to 9.0) on drivers older
+# than R580, and for every pre-Turing card regardless of driver. It does NOT
+# cover Blackwell (compute 12.x, the RTX 50 series): those cards fail every
+# kernel launch on this build with "no kernel image is available for execution
+# on the device". Setup never picks it for them.
+--extra-index-url https://download.pytorch.org/whl/cu126
+-r requirements-common.txt
+torch==2.13.0+cu126
+torchvision==0.28.0+cu126

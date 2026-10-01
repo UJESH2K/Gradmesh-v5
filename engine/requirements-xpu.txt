@@ -1,11 +1,10 @@
-# Intel XPU training plane. The exact +xpu pins prevent replacement by CPU/CUDA wheels.
+# Intel training plane, PyTorch XPU build.
+#
+# Arc discrete GPUs (A and B series) and Core Ultra processors with Arc
+# Graphics. The +xpu pins stop pip from swapping in a CPU or CUDA wheel. Since
+# PyTorch 2.7 the XPU wheels pull the SYCL and oneMKL runtimes from PyPI, so
+# only the Intel graphics driver is needed on the machine, not a oneAPI install.
 --extra-index-url https://download.pytorch.org/whl/xpu
--r requirements-control.txt
+-r requirements-common.txt
 torch==2.13.0+xpu
 torchvision==0.28.0+xpu
-ultralytics==8.4.46
-numpy
-opencv-python
-scipy
-# Figures for the benchmark report.
-matplotlib>=3.8

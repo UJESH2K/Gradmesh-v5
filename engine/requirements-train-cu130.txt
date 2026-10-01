@@ -1,0 +1,15 @@
+# NVIDIA training plane, CUDA 13.0 build. The default for NVIDIA.
+#
+# Covers Turing through Blackwell: compute capability 7.5 to 12.x, which is
+# the RTX 20 series onward, including the RTX 50 series. Needs NVIDIA driver
+# R580 or newer. CUDA 13 dropped Maxwell, Pascal and Volta, which stay on
+# requirements-train-cu126.txt. Setup chooses between them from the compute
+# capability and the driver version that nvidia-smi reports (engine/hardware.py).
+#
+# The torch and torchvision pins are the GradMesh reference stack, identical
+# across NVIDIA, Intel XPU and Apple MPS. Keep them in step with
+# engine/version.py.
+--extra-index-url https://download.pytorch.org/whl/cu130
+-r requirements-common.txt
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130

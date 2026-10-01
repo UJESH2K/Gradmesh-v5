@@ -195,12 +195,27 @@ def _state_dict_from_bytes(state_bytes: bytes) -> dict[str, Any]:
     raise ValueError("Serialized payload does not contain a state_dict")
 
 
-def encode_state_dict(state_dict: dict[str, Any]) -> str:
+def state_dict_to_bytes(state_dict: dict[str, Any]) -> bytes:
+    """Serialise on CPU, so the bytes are identical whichever backend trained them.
+
+    A tensor saved straight from an MPS or XPU device records that device, and
+    a CUDA machine loading it would try to restore it there. Moving every
+    tensor to CPU first is what lets Apple, Intel and NVIDIA workers exchange
+    weights at all.
+    """
     if torch is None:
         raise RuntimeError("torch is required for weight synchronization")
     buffer = io.BytesIO()
     torch.save({key: value.detach().cpu() if hasattr(value, "detach") else value for key, value in state_dict.items()}, buffer)
-    return encode_bytes_to_base64(buffer.getvalue())
+    return buffer.getvalue()
+
+
+def state_dict_from_bytes(state_bytes: bytes) -> dict[str, Any]:
+    return _state_dict_from_bytes(state_bytes)
+
+
+def encode_state_dict(state_dict: dict[str, Any]) -> str:
+    return encode_bytes_to_base64(state_dict_to_bytes(state_dict))
 
 
 def decode_state_dict(data_b64: str) -> dict[str, Any]:

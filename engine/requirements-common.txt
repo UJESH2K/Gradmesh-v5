@@ -1,0 +1,12 @@
+# Everything the training plane needs apart from PyTorch itself.
+#
+# Shared by every backend so an NVIDIA, an Intel and an Apple machine run the
+# same Ultralytics and the same numerics around it. The PyTorch build is the
+# only thing that differs between the requirement files that include this one.
+-r requirements-control.txt
+ultralytics==8.4.46
+numpy>=1.26,<3
+opencv-python>=4.9
+scipy>=1.11
+# Figures for the benchmark report.
+matplotlib>=3.8

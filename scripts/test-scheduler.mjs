@@ -17,8 +17,8 @@ sys.path.insert(0, ".")
 from coordinator.scheduler import (
     MeshPolicy, admit, aggregation_weights, calibration_factor, deadline_for,
     efficiency, imbalance, plan_round, safe_batch_size, should_abort_round,
-    straggler_action, update_reliability, update_throughput,
-    PARTITION_EQUAL, PARTITION_PROPORTIONAL,
+    straggler_action, update_reliability, update_throughput, update_fixed, affine_split,
+    PARTITION_EQUAL, PARTITION_LINEAR, PARTITION_PROPORTIONAL,
 )
 
 failures = []
@@ -32,12 +32,12 @@ def expect(name, condition, detail=""):
 
 now = time.time()
 
-def node(nid, gflops, mem=8192, thr=0.0, rel=0.85, lat=5.0, active=True, training=True):
+def node(nid, gflops, mem=8192, thr=0.0, rel=0.85, lat=5.0, active=True, training=True, fixed=0.0, backend="cuda"):
     return {
         "node_id": nid, "capability": {"gflops": gflops}, "gpu_memory_mb": mem,
         "allocated_memory_mb": 0, "last_seen": now, "active": active,
         "supports_training": training, "reliability": rel, "latency_ms": lat,
-        "throughput_sps": thr,
+        "throughput_sps": thr, "fixed_seconds": fixed, "backend": backend,
     }
 
 # 1. A heterogeneous mesh finishes together rather than waiting on the slowest.
@@ -185,6 +185,77 @@ expect("a larger image size lowers the ceiling",
        safe_batch_size(4096, 640, 16) < safe_batch_size(4096, 416, 16))
 expect("a node's own maximum is respected",
        safe_batch_size(24576, 320, 16, node_max=2) == 2)
+
+# 13. The v5 affine cost model: a fixed overhead per round plus a per-image rate.
+#     Leg 1 fitted T(n) = 18.77 s + 0.0418 s/image * n on one RTX 5070, about
+#     24 images per second after a 19 second fixed cost.
+LEG1_FIXED, LEG1_RATE = 18.77, 1.0 / 0.0418
+twins = [node("a", 24000, thr=LEG1_RATE, fixed=LEG1_FIXED), node("b", 24000, thr=LEG1_RATE, fixed=LEG1_FIXED)]
+two = plan_round(twins, 1000)
+expect("the affine model reproduces leg 1's two-machine ceiling at 1000 images (1.53x)",
+       abs(two.predicted_speedup - 1.53) < 0.03, "%.3f" % two.predicted_speedup)
+small = plan_round(twins, 100)
+expect("and its near-flat result at 100 images (about 1.1x)",
+       1.0 <= small.predicted_speedup < 1.2, "%.3f" % small.predicted_speedup)
+
+uneven = [node("quick", 9000, thr=10.0, fixed=5.0), node("slow-start", 9000, thr=10.0, fixed=30.0)]
+big = plan_round(uneven, 2000)
+finish = [a.predicted_seconds for a in big.assignments]
+expect("affine shards equalise finish time including overhead",
+       len(finish) == 2 and max(finish) - min(finish) < 0.5, json.dumps(finish))
+expect("the machine with less overhead takes more of the data",
+       {a.node_id: a.samples for a in big.assignments}["quick"] > {a.node_id: a.samples for a in big.assignments}["slow-start"])
+linear = plan_round(uneven, 2000, strategy=PARTITION_LINEAR)
+expect("the affine planner beats v4's rate-only split when overheads differ",
+       big.predicted_makespan_seconds < linear.predicted_makespan_seconds - 5,
+       "%.1f vs %.1f" % (big.predicted_makespan_seconds, linear.predicted_makespan_seconds))
+
+tiny = plan_round(uneven, 200)
+expect("a machine whose overhead exceeds the round sits it out",
+       [a.node_id for a in tiny.assignments] == ["quick"] and any("overhead" in r["reason"] for r in tiny.rejected),
+       json.dumps(tiny.as_dict()["assignments"]))
+expect("sitting it out is faster than including it",
+       tiny.predicted_makespan_seconds <= plan_round(uneven, 200, strategy=PARTITION_LINEAR).predicted_makespan_seconds)
+
+import random
+rng = random.Random(7)
+monotone = True
+for trial in range(200):
+    pool_size = rng.randint(1, 5)
+    machines = [node("m%d" % i, 5000, thr=rng.uniform(2, 60), fixed=rng.uniform(1, 40)) for i in range(pool_size)]
+    extra = node("extra", 5000, thr=rng.uniform(2, 60), fixed=rng.uniform(1, 40))
+    n = rng.randint(50, 5000)
+    before = plan_round(machines, n, MeshPolicy(max_shard_skew=1000.0, min_shard_samples=1))
+    after = plan_round(machines + [extra], n, MeshPolicy(max_shard_skew=1000.0, min_shard_samples=1))
+    if after.predicted_makespan_seconds > before.predicted_makespan_seconds + 0.05:
+        monotone = False
+        break
+expect("adding any machine never lengthens an affine plan (200 random meshes)", monotone)
+
+shares, finish_time, excluded = affine_split({"x": 10.0, "y": 10.0}, {"x": 5.0, "y": 5.0}, 1000, {"x": 100.0})
+expect("a probation cap holds under the affine split", abs(shares["x"] - 100.0) < 1e-6 and abs(shares["y"] - 900.0) < 1e-6,
+       json.dumps(shares))
+
+veteran_fixed = node("v", 3000, thr=20.0, fixed=12.0)
+expect("a measured fixed cost is learned and smoothed", 12.0 < update_fixed(veteran_fixed, 20.0) < 20.0)
+expect("one wild observation cannot move an estimate more than the step limit",
+       update_throughput(node("w", 3000, thr=20.0), 1000, 1.0) <= 20.0 * MeshPolicy().max_estimate_step)
+unmeasured_pair = plan_round([node("p", 4000, thr=20.0, fixed=8.0), node("q", 4000)], 1000)
+expect("an unmeasured machine borrows the mesh's measured overhead",
+       {a.node_id: a.fixed_seconds for a in unmeasured_pair.assignments}.get("q") == 8.0,
+       json.dumps(unmeasured_pair.as_dict()["assignments"]))
+
+# 14. Mixed vendors plan on measured rates, not vendor names.
+mixed_vendors = [node("rtx", 20000, thr=30.0, fixed=8.0, backend="cuda"),
+                 node("arc", 9000, thr=14.0, fixed=10.0, backend="xpu"),
+                 node("m3", 6000, thr=9.0, fixed=9.0, backend="mps")]
+vendor_plan = plan_round(mixed_vendors, 3000)
+expect("NVIDIA, Intel and Apple machines all receive work",
+       sorted(a.backend for a in vendor_plan.assignments) == ["cuda", "mps", "xpu"])
+vendor_finish = [a.predicted_seconds for a in vendor_plan.assignments]
+expect("and are predicted to finish together", max(vendor_finish) - min(vendor_finish) < 0.5, json.dumps(vendor_finish))
+expect("unified memory gets a more conservative batch than the same dedicated memory",
+       safe_batch_size(16384, 640, 64, unified_memory=True) < safe_batch_size(16384, 640, 64))
 
 print("")
 if failures:

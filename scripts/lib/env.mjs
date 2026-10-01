@@ -5,11 +5,18 @@ import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { machinePaths, stateDir } from "./paths.mjs";
+
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const ENGINE_DIR = path.join(REPO_ROOT, "engine");
-export const STATE_DIR = path.join(REPO_ROOT, ".gradmesh");
-export const VENV_DIR = path.join(REPO_ROOT, ".venv");
+export const STATE_DIR = stateDir(REPO_ROOT);
+export const PATHS = machinePaths(REPO_ROOT);
+export const VENV_DIR = PATHS.venv;
 export const IS_WINDOWS = process.platform === "win32";
+
+/** Interpreters PyTorch 2.13 publishes wheels for on every supported backend. */
+export const PYTHON_MIN = [3, 10];
+export const PYTHON_MAX = [3, 13];
 
 export const COORDINATOR_PORT = Number(process.env.GRADMESH_COORDINATOR_PORT || 8000);
 export const WEB_PORT = Number(process.env.PORT || 3000);
@@ -51,41 +58,129 @@ function stripAnsi(value) {
 }
 
 export function venvPython() {
-  return IS_WINDOWS
-    ? path.join(VENV_DIR, "Scripts", "python.exe")
-    : path.join(VENV_DIR, "bin", "python");
+  return PATHS.venvPython;
 }
 
+/** Present on disk. Whether it actually runs here is setup_env.py's job to check. */
 export function venvReady() {
   return existsSync(venvPython());
 }
 
+function versionSupported(major, minor) {
+  const value = major * 100 + minor;
+  return value >= PYTHON_MIN[0] * 100 + PYTHON_MIN[1] && value <= PYTHON_MAX[0] * 100 + PYTHON_MAX[1];
+}
+
 /**
- * Find a usable system Python. Windows ships a `python` shim that opens the
- * Microsoft Store instead of running anything, so a version check is the only
- * reliable probe.
+ * Find a system Python that PyTorch 2.13 has wheels for.
+ *
+ * Accepting "3.9 or newer", as v4 did, is how a machine with only Python 3.14
+ * got as far as a 2 GB download before pip announced there was no matching
+ * wheel. The range is checked up front instead, preferring 3.12.
+ *
+ * Windows ships a `python` shim that opens the Microsoft Store instead of
+ * running anything, so a version check is the only reliable probe.
  */
 export function findSystemPython() {
+  const preferred = ["3.12", "3.11", "3.13", "3.10"];
   const candidates = IS_WINDOWS
-    ? ["py -3.12", "py -3.11", "py -3", "python", "python3"]
-    : ["python3.12", "python3.11", "python3", "python"];
+    ? [...preferred.map((version) => `py -${version}`), "python", "python3"]
+    : [
+        ...preferred.map((version) => `python${version}`),
+        ...(process.platform === "darwin"
+          ? preferred.flatMap((version) => [
+              `/opt/homebrew/bin/python${version}`,
+              `/usr/local/bin/python${version}`,
+              `/Library/Frameworks/Python.framework/Versions/${version}/bin/python3`,
+            ])
+          : []),
+        "python3",
+        "python",
+      ];
 
+  const rejected = [];
   for (const candidate of candidates) {
-    const [command, ...args] = candidate.split(" ");
+    const [command, ...args] = candidate.startsWith("/") ? [candidate] : candidate.split(" ");
     // No shell here: cmd.exe mangles the quoting, and PATH lookup for .exe
     // files works without one anyway.
     const probe = spawnSync(
       command,
-      [...args, "-c", "import sys;print(sys.version_info.major);print(sys.version_info.minor)"],
-      { encoding: "utf8" }
+      [...args, "-c", "import sys;print(sys.version_info.major);print(sys.version_info.minor);print(sys.executable)"],
+      { encoding: "utf8", windowsHide: true }
     );
     if (probe.status !== 0) continue;
-    const [major, minor] = (probe.stdout || "").trim().split(/\s+/).map(Number);
-    if (major === 3 && minor >= 9) {
-      return { command, args, version: `${major}.${minor}` };
+    const [majorText, minorText, executable] = (probe.stdout || "").trim().split(/\r?\n/);
+    const major = Number(majorText);
+    const minor = Number(minorText);
+    if (major === 3 && versionSupported(major, minor)) {
+      return { command, args, version: `${major}.${minor}`, executable: executable?.trim() };
     }
+    if (Number.isFinite(major) && Number.isFinite(minor)) rejected.push(`${major}.${minor}`);
   }
-  return null;
+  return rejected.length ? { missing: true, rejected: [...new Set(rejected)] } : null;
+}
+
+export function pythonInstallHint() {
+  if (IS_WINDOWS) return "winget install Python.Python.3.12";
+  if (process.platform === "darwin") return "brew install python@3.12   (macOS's built-in python3 is 3.9, too old)";
+  return "sudo apt install python3.12 python3.12-venv   (or your distribution's equivalent)";
+}
+
+/** findSystemPython, or exit with an instruction a person can act on. */
+export function requireSystemPython() {
+  const found = findSystemPython();
+  if (found && !found.missing) return found;
+  const rejected = found?.rejected?.length
+    ? ` Found ${found.rejected.join(", ")}, which the pinned PyTorch has no wheels for.`
+    : "";
+  console.error(
+    paint(
+      "red",
+      `\nGradMesh needs Python ${PYTHON_MIN.join(".")} to ${PYTHON_MAX.join(".")} on PATH.${rejected}\n` +
+        `  Install it:  ${pythonInstallHint()}\n` +
+        "  then open a new terminal and run the command again.\n"
+    )
+  );
+  process.exit(1);
+}
+
+let cachedProfile = null;
+
+/**
+ * This machine's GPU and the PyTorch build it needs, from engine/hardware.py.
+ *
+ * The rules live in Python, in one place, because the join flow runs them on
+ * machines that have no Node. This only shells out to them.
+ */
+export function detectGpuProfile({ host = true } = {}) {
+  if (cachedProfile) return cachedProfile;
+  const system = findSystemPython();
+  const python = system && !system.missing ? system : venvReady() ? { command: venvPython(), args: [] } : null;
+  if (!python) {
+    return {
+      facts: null,
+      profile: { name: "unknown", backend: "unknown", label: "unknown", reason: "no supported Python was found" },
+    };
+  }
+  const probe = spawnSync(
+    python.command,
+    [...python.args, path.join(ENGINE_DIR, "hardware.py"), "--json", ...(host ? ["--host"] : [])],
+    { encoding: "utf8", windowsHide: true, timeout: 60000 }
+  );
+  try {
+    cachedProfile = JSON.parse(probe.stdout);
+  } catch {
+    cachedProfile = {
+      facts: null,
+      profile: {
+        name: "unknown",
+        backend: "unknown",
+        label: "unknown",
+        reason: (probe.stderr || "hardware detection failed").trim().slice(-300),
+      },
+    };
+  }
+  return cachedProfile;
 }
 
 export function ensureStateDir() {
@@ -206,157 +301,3 @@ export async function waitForHttp(url, { timeoutMs = 120000, intervalMs = 400 } 
   throw new Error(`Timed out waiting for ${url}`);
 }
 
-/**
- * Which PyTorch build this machine needs.
- *
- * Matching on the vendor name alone is not enough, and getting that wrong is
- * silent until training starts. A CUDA wheel only contains compiled kernels for
- * the architectures it was built against: the cu12.1 build covers sm_50 through
- * sm_90, which is Maxwell through Hopper. Blackwell, the RTX 50 series, is
- * sm_120 and appears in none of them. Such a card installs cleanly, reports
- * itself as available, and then fails every kernel launch with "no kernel image
- * is available for execution on the device". No driver update fixes it, because
- * the kernels were never compiled.
- *
- * nvidia-smi reports the compute capability without PyTorch being installed,
- * which resolves the chicken and egg, and is why the profile is chosen from a
- * number rather than from a marketing name.
- */
-export function detectGpuProfile() {
-  const nvidia = queryNvidiaSmi();
-  if (nvidia) {
-    const { name, capability } = nvidia;
-    if (capability === null) {
-      // An old nvidia-smi with no compute_cap field. cu121 covers everything
-      // that shipped before that field existed, so it is the safer guess.
-      return {
-        vendor: "cuda",
-        name,
-        capability: null,
-        profile: "cuda-cu121",
-        file: "requirements-train-cu121.txt",
-        label: "PyTorch CUDA 12.1 build",
-        backend: "cuda",
-        reason: "nvidia-smi did not report a compute capability, assuming pre-Blackwell",
-      };
-    }
-    if (capability >= 12.0) {
-      return {
-        vendor: "cuda",
-        name,
-        capability,
-        profile: "cuda-cu128",
-        file: "requirements-train-cu128.txt",
-        label: "PyTorch CUDA 12.8 build",
-        backend: "cuda",
-        reason: `compute capability ${capability.toFixed(1)} is Blackwell or newer, which needs CUDA 12.8`,
-      };
-    }
-    if (capability >= 5.0) {
-      return {
-        vendor: "cuda",
-        name,
-        capability,
-        profile: "cuda-cu121",
-        file: "requirements-train-cu121.txt",
-        label: "PyTorch CUDA 12.1 build",
-        backend: "cuda",
-        reason: `compute capability ${capability.toFixed(1)} is covered by the CUDA 12.1 build`,
-      };
-    }
-    return {
-      vendor: "cpu",
-      name,
-      capability,
-      profile: "cpu",
-      file: "requirements-train-cpu.txt",
-      label: "PyTorch CPU build",
-      backend: "cpu",
-      reason: `compute capability ${capability.toFixed(1)} is too old for any current PyTorch CUDA build`,
-    };
-  }
-
-  const names = videoControllerNames().toLowerCase();
-  if (names.includes("intel(r) arc") || names.includes("intel arc") || names.includes("intel corporation dg2")) {
-    return {
-      vendor: "xpu",
-      name: "Intel Arc",
-      capability: null,
-      profile: "xpu",
-      file: "requirements-xpu.txt",
-      label: "PyTorch Intel XPU build",
-      backend: "xpu",
-      reason: "an Intel Arc GPU was detected",
-    };
-  }
-
-  return {
-    vendor: "cpu",
-    name: names.split(";")[0] || "unknown",
-    capability: null,
-    profile: "cpu",
-    file: "requirements-train-cpu.txt",
-    label: "PyTorch CPU build",
-    backend: "cpu",
-    reason: "no supported GPU was detected",
-  };
-}
-
-/** Name and compute capability from nvidia-smi, or null when there is no NVIDIA GPU. */
-function queryNvidiaSmi() {
-  try {
-    const probe = spawnSync(
-      "nvidia-smi",
-      ["--query-gpu=name,compute_cap", "--format=csv,noheader"],
-      { encoding: "utf8" }
-    );
-    if (probe.status !== 0 || !probe.stdout) return null;
-
-    // Multiple GPUs: take the most capable, which is what training will use.
-    const rows = probe.stdout
-      .trim()
-      .split(/\r?\n/)
-      .map((line) => line.split(",").map((part) => part.trim()))
-      .filter((parts) => parts[0]);
-    if (rows.length === 0) return null;
-
-    let best = { name: rows[0][0], capability: null };
-    for (const [name, cap] of rows) {
-      const parsed = Number.parseFloat(cap);
-      const capability = Number.isFinite(parsed) ? parsed : null;
-      if (capability !== null && (best.capability === null || capability > best.capability)) {
-        best = { name, capability };
-      }
-    }
-    return best;
-  } catch {
-    return null;
-  }
-}
-
-function videoControllerNames() {
-  try {
-    if (IS_WINDOWS) {
-      const probe = spawnSync(
-        "powershell",
-        ["-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name -join ';'"],
-        { encoding: "utf8" }
-      );
-      return probe.stdout || "";
-    }
-    if (process.platform === "linux") {
-      const probe = spawnSync("sh", ["-c", "lspci 2>/dev/null | grep -i 'vga\\|3d\\|display'"], {
-        encoding: "utf8",
-      });
-      return probe.stdout || "";
-    }
-  } catch {
-    // Fall through to unknown.
-  }
-  return "";
-}
-
-/** Kept for callers that only need the coarse answer. */
-export function detectGpuVendor() {
-  return detectGpuProfile().vendor;
-}

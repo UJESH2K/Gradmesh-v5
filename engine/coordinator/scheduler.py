@@ -9,9 +9,13 @@ This module replaces that with four cooperating policies.
 
 1. Admission control. A device is measured, not trusted. admit() decides whether
    a node may hold a shard at all, and at which tier.
-2. Predictive proportional sharding. plan_round() sizes each shard so every
-   admitted worker is predicted to finish at the same instant, which minimises
-   round makespan instead of round variance.
+2. Predictive affine sharding. Each machine is modelled as a fixed cost per
+   round plus a per-sample rate, both learned from its own rounds, and
+   plan_round() sizes shards so every admitted worker is predicted to finish at
+   the same instant under that model. A machine whose overhead alone exceeds
+   the round sits it out. v4 sized on rate alone, which leg 1 showed is wrong
+   whenever the fixed cost is a large part of a round: at 100 images per round
+   it was 82% of it.
 3. Straggler mitigation. deadline_for() derives a soft and hard deadline from
    the same prediction. A soft miss triggers speculative re-execution on an idle
    fast worker; a hard miss drops the shard from the barrier and returns its
@@ -30,7 +34,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------------------
 # Policy
@@ -58,6 +62,10 @@ class MeshPolicy:
     # Sharding.
     min_shard_samples: int = 8          # smaller shards cost more to ship than to run
     max_shard_skew: float = 6.0         # cap fastest:slowest ratio for gradient diversity
+    # Fixed per-round cost assumed for a machine before it has been measured:
+    # transfer, model load, trainer and dataloader construction. Replaced by
+    # the mesh's own median as soon as any machine has finished a round.
+    default_fixed_seconds: float = 10.0
 
     # Straggler mitigation.
     soft_deadline_factor: float = 1.6   # predicted * this -> speculative backup
@@ -74,6 +82,10 @@ class MeshPolicy:
 
     # Learning.
     throughput_ewma_alpha: float = 0.35
+    # One observation may move an estimate by at most this factor. Leg 1 saw
+    # one machine swing 3x between rounds of the same trial; a robust update
+    # stops a single noisy round from rewriting the next plan.
+    max_estimate_step: float = 2.5
     reliability_reward: float = 0.06
     reliability_penalty: float = 0.25
 
@@ -85,7 +97,14 @@ class MeshPolicy:
         if not data:
             return cls()
         defaults = cls()
-        known = {name: data[name] for name in vars(defaults) if name in data}
+        known = {}
+        for name, default in vars(defaults).items():
+            if name not in data:
+                continue
+            # The dashboard sends every value as a number; keep integer fields
+            # integral so they compare and format as they did before saving.
+            value = data[name]
+            known[name] = int(round(float(value))) if isinstance(default, int) and not isinstance(default, bool) else value
         return cls(**known)
 
 
@@ -173,11 +192,15 @@ TIER_FULL = "full"
 TIER_PROBATION = "probation"
 TIER_REJECTED = "rejected"
 
-# Partitioning strategies. PROPORTIONAL is the contribution of this work;
-# EQUAL is the naive baseline it has to beat, and the benchmark harness runs
-# both over identical hardware so the comparison is not merely asserted.
+# Partitioning strategies. PROPORTIONAL is the v5 affine planner and the
+# contribution of this work. LINEAR is v4's rate-only proportional split, kept
+# so the improvement can be measured rather than asserted, and EQUAL is the
+# naive baseline both have to beat. The benchmark harness runs any of them
+# over identical hardware.
 PARTITION_PROPORTIONAL = "proportional"
+PARTITION_LINEAR = "proportional-linear"
 PARTITION_EQUAL = "equal"
+PARTITION_STRATEGIES = (PARTITION_PROPORTIONAL, PARTITION_LINEAR, PARTITION_EQUAL)
 
 
 @dataclass
@@ -294,7 +317,7 @@ def admit(
 
 
 # --------------------------------------------------------------------------
-# Predictive proportional sharding
+# Predictive affine sharding
 # --------------------------------------------------------------------------
 
 
@@ -307,6 +330,10 @@ class ShardAssignment:
     tier: str
     throughput_sps: float
     predicted_seconds: float
+    # The fixed part of predicted_seconds, so the dashboard and the paper can
+    # show how much of a round is overhead rather than compute.
+    fixed_seconds: float = 0.0
+    backend: str = ""
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -371,23 +398,17 @@ def probe_throughput(node: dict) -> float:
 def calibration_factor(nodes: Sequence[dict]) -> float:
     """Scale probe estimates onto the same scale as measured throughput.
 
-    The probe estimates steady-state compute. A measured round also contains
-    everything Ultralytics does once per call: the AMP check, dataloader
-    construction, model setup and final validation. On a small shard those fixed
-    costs dominate, so a machine that has finished a round reports far fewer
-    samples per second than its probe implies. Measured on this hardware the gap
-    was 2.6 against 37, a factor of fourteen.
-
-    Mixing the two scales in one plan is what does the damage: a node that had
-    never run looked fourteen times faster than an identical node that had, so
-    the planner handed it nearly the whole dataset and dropped the other for
-    falling under the minimum shard size.
+    The probe estimates steady-state compute; a measured rate includes data
+    loading and the optimiser. Mixing the two scales in one plan is what does
+    the damage: a node that had never run looked many times faster than an
+    identical node that had, so the planner handed it nearly the whole dataset
+    and dropped the other for falling under the minimum shard size.
 
     So probe values are multiplied by the ratio this mesh actually achieves,
-    taken as the median over nodes that have both numbers. With no measurements
-    yet the factor is 1.0 and every node is on the probe scale together, which is
-    equally consistent. This corrects the scale, not the shape: relative
-    differences between devices still come from the probe.
+    taken as the median over nodes that have both numbers. With no
+    measurements yet the factor is 1.0 and every node is on the probe scale
+    together, which is equally consistent. This corrects the scale, not the
+    shape: relative differences between devices still come from the probe.
     """
     ratios = [
         float(node.get("throughput_sps") or 0.0) / probe_throughput(node)
@@ -418,6 +439,27 @@ def effective_throughput(
     if measured > 0:
         return measured
     return max(0.01, probe_throughput(node) * calibration)
+
+
+def mesh_fixed_prior(nodes: Sequence[dict], policy: MeshPolicy = DEFAULT_POLICY) -> float:
+    """Fixed per-round cost to assume for a node that has not been measured yet.
+
+    The median of what this mesh has measured, or the policy default before
+    anything has. Using the mesh's own number keeps an unmeasured node on the
+    same footing as its measured peers, for the same reason calibration does.
+    """
+    measured = sorted(
+        float(node.get("fixed_seconds") or 0.0) for node in nodes if float(node.get("fixed_seconds") or 0.0) > 0
+    )
+    if not measured:
+        return float(policy.default_fixed_seconds)
+    middle = len(measured) // 2
+    return measured[middle] if len(measured) % 2 else (measured[middle - 1] + measured[middle]) / 2.0
+
+
+def effective_fixed(node: dict, prior: float) -> float:
+    measured = float(node.get("fixed_seconds") or 0.0)
+    return measured if measured > 0 else prior
 
 
 def _proportional_with_caps(rates: Dict[str, float], caps: Dict[str, float]) -> Dict[str, float]:
@@ -456,6 +498,79 @@ def _proportional_with_caps(rates: Dict[str, float], caps: Dict[str, float]) -> 
     return shares
 
 
+def affine_split(
+    rates: Dict[str, float],
+    fixed: Dict[str, float],
+    total: float,
+    caps: Optional[Dict[str, float]] = None,
+) -> Tuple[Dict[str, float], float, List[str]]:
+    """Sample counts that make every participant finish at one instant T.
+
+    Node i costs `fixed_i + s_i / rate_i` for a shard of s_i samples. Setting
+    every finish time equal to T gives s_i = rate_i * (T - fixed_i), and the
+    shards must sum to the dataset:
+
+        T = (N + sum_i rate_i * fixed_i) / sum_i rate_i
+
+    over the participating nodes. A node whose fixed cost alone exceeds T would
+    receive a negative share: it cannot finish its overhead before everyone
+    else has finished the whole round, so including it can only make the round
+    longer. Those nodes sit the round out. Participants are found by water
+    filling in order of fixed cost, which yields the minimum achievable T.
+
+    Caps, given in samples, are honoured by fixing a capped node at its cap and
+    re-solving for the rest.
+
+    Returns (samples per node, T, nodes excluded for overhead).
+    """
+    caps = caps or {}
+    active = [node_id for node_id in rates if rates[node_id] > 0]
+    assigned: Dict[str, float] = {}
+    remaining = float(total)
+    excluded: List[str] = []
+    finish = 0.0
+
+    for _ in range(len(active) + 1):
+        if not active or remaining <= 0:
+            break
+        order = sorted(active, key=lambda node_id: fixed.get(node_id, 0.0))
+        participants = order
+        for count in range(1, len(order) + 1):
+            subset = order[:count]
+            rate_sum = sum(rates[node_id] for node_id in subset)
+            candidate = (remaining + sum(rates[n] * fixed.get(n, 0.0) for n in subset)) / rate_sum
+            if count == len(order) or candidate <= fixed.get(order[count], 0.0):
+                finish = candidate
+                participants = subset
+                break
+        excluded.extend(node_id for node_id in order if node_id not in participants and node_id not in excluded)
+        shares = {node_id: rates[node_id] * (finish - fixed.get(node_id, 0.0)) for node_id in participants}
+
+        over = [node_id for node_id in participants if node_id in caps and shares[node_id] > caps[node_id]]
+        if not over:
+            assigned.update(shares)
+            break
+        for node_id in over:
+            assigned[node_id] = caps[node_id]
+            remaining -= caps[node_id]
+            active.remove(node_id)
+        # Capped nodes are fixed; the rest re-solve for what is left. Nodes
+        # that were excluded get another chance because T may have moved.
+        active = [node_id for node_id in active if node_id not in assigned]
+        excluded = []
+
+    # Every node was capped and samples remain: spread the rest proportionally.
+    leftover = float(total) - sum(assigned.values())
+    if leftover > 1e-6 and assigned:
+        weight = sum(rates[node_id] for node_id in assigned) or 1.0
+        for node_id in assigned:
+            assigned[node_id] += leftover * rates[node_id] / weight
+
+    if assigned:
+        finish = max(fixed.get(node_id, 0.0) + value / rates[node_id] for node_id, value in assigned.items())
+    return assigned, finish, [node_id for node_id in excluded if node_id not in assigned]
+
+
 def plan_round(
     nodes: Sequence[dict],
     total_samples: int,
@@ -465,20 +580,25 @@ def plan_round(
 ) -> RoundPlan:
     """Size every shard so all admitted workers finish together.
 
-    With throughput r_i and shard size s_i, worker time is s_i / r_i. Makespan is
-    minimised when every s_i / r_i is equal, which gives s_i proportional to
-    r_i. We then apply the probation cap and the skew cap, redistribute any
-    trimmed samples over the remaining headroom, and finally repair rounding so
-    the shards sum back to exactly total_samples.
+    Three strategies, which the benchmark harness can run side by side over
+    identical hardware:
 
-    Passing strategy=PARTITION_EQUAL gives every admitted worker the same number
-    of samples instead. That is deliberately the wrong policy for heterogeneous
-    hardware, and it exists so the benchmark harness can measure how wrong: it
-    is the control arm for the load-balancing ablation. Admission, deadlines and
-    aggregation are identical in both arms, so the only variable is shard size.
+    * `proportional` (v5, the default). Each node is an affine cost, a fixed
+      overhead per round plus a per-sample rate, both learned from its own
+      rounds. Shards equalise predicted finish time under that model, and a
+      node whose overhead exceeds the round sits it out. See `affine_split`.
+    * `proportional-linear` (v4). Shards proportional to rate alone. Correct
+      when overhead is negligible; on small rounds it overloads nobody but
+      hands slow-starting machines work they cannot finish in time, which is
+      the over-correction leg 1 saw at 100 images.
+    * `equal`. The naive baseline: every admitted worker gets the same share.
+
+    Admission, deadlines and aggregation are identical across strategies, so
+    the only variable an ablation measures is shard size. Rounding is then
+    repaired by largest remainder so the shards sum to exactly total_samples.
     """
     if total_samples <= 0:
-        return RoundPlan(total_samples=0)
+        return RoundPlan(total_samples=0, strategy=strategy)
 
     decisions = admit(nodes, policy, now)
     by_id = {n["node_id"]: n for n in nodes}
@@ -499,57 +619,70 @@ def plan_round(
 
     # One scale for every node, whether measured or merely probed.
     calibration = calibration_factor(eligible)
+    prior = mesh_fixed_prior(eligible, policy)
     rates = {n["node_id"]: effective_throughput(n, policy, calibration) for n in eligible}
+    fixed = {n["node_id"]: effective_fixed(n, prior) for n in eligible}
+    caps = {
+        node_id: policy.probation_shard_cap * total_samples
+        for node_id in rates
+        if decisions[node_id].tier == TIER_PROBATION
+    }
 
-    if strategy == PARTITION_EQUAL:
-        # The control arm. Every admitted worker carries the same share, which
-        # is what a scheduler that ignores capability does. Rates are still
-        # measured, because the predicted finish times are what expose the
-        # imbalance this arm is meant to demonstrate.
-        share = 1.0 / len(rates)
-        shares = {node_id: share for node_id in rates}
-    else:
+    def split(candidate_rates: Dict[str, float]) -> Tuple[Dict[str, float], List[str]]:
+        if strategy == PARTITION_EQUAL:
+            share = float(total_samples) / len(candidate_rates)
+            return {node_id: share for node_id in candidate_rates}, []
         # Skew cap: a device that is 40x slower still needs enough samples for
-        # its gradient to mean something, so clamp the ratio before
-        # proportioning.
-        fastest = max(rates.values())
+        # its gradient to mean something, so clamp the ratio before sizing.
+        fastest = max(candidate_rates.values())
         floor_rate = fastest / policy.max_shard_skew
-        rates = {node_id: max(rate, floor_rate) for node_id, rate in rates.items()}
-
-        caps = {
-            node_id: (
-                policy.probation_shard_cap
-                if decisions[node_id].tier == TIER_PROBATION
-                else 1.0
+        sizing_rates = {node_id: max(rate, floor_rate) for node_id, rate in candidate_rates.items()}
+        if strategy == PARTITION_LINEAR:
+            fractions = _proportional_with_caps(
+                sizing_rates, {node_id: cap / total_samples for node_id, cap in caps.items()}
             )
-            for node_id in rates
-        }
+            return {node_id: fraction * total_samples for node_id, fraction in fractions.items()}, []
+        shares, _, excluded = affine_split(
+            sizing_rates,
+            {node_id: fixed[node_id] for node_id in sizing_rates},
+            total_samples,
+            {node_id: caps[node_id] for node_id in sizing_rates if node_id in caps},
+        )
+        return shares, excluded
 
-        shares = _proportional_with_caps(rates, caps)
-
-    raw = {node_id: share * total_samples for node_id, share in shares.items()}
-    samples = {node_id: int(math.floor(value)) for node_id, value in raw.items()}
-
-    # Drop shards too small to be worth shipping, then re-proportion their samples.
-    too_small = [
-        node_id
-        for node_id, count in samples.items()
-        if count < policy.min_shard_samples
-    ]
-    for node_id in too_small:
-        if len(samples) <= 1:
-            break
+    candidates = dict(rates)
+    raw, excluded = split(candidates)
+    for node_id in excluded:
         rejected.append(
             {
                 "node_id": node_id,
-                "reason": "shard of %d samples is below the %d sample floor"
-                % (samples[node_id], policy.min_shard_samples),
+                "reason": "its %.0fs of fixed overhead per round is longer than the whole round would take "
+                "without it, so it would only slow the round down" % fixed[node_id],
                 "fitness": round(decisions[node_id].fitness, 4),
             }
         )
-        samples.pop(node_id)
-        rates.pop(node_id, None)
+        candidates.pop(node_id, None)
 
+    # Drop shards too small to be worth shipping, smallest first, and re-plan
+    # after each drop because the remaining shards grow.
+    while len(raw) > 1:
+        smallest = min(raw, key=lambda node_id: raw[node_id])
+        if raw[smallest] >= policy.min_shard_samples:
+            break
+        rejected.append(
+            {
+                "node_id": smallest,
+                "reason": "shard of %d samples is below the %d sample floor"
+                % (int(raw[smallest]), policy.min_shard_samples),
+                "fitness": round(decisions[smallest].fitness, 4),
+            }
+        )
+        candidates.pop(smallest, None)
+        raw, more = split(candidates)
+        for node_id in more:
+            candidates.pop(node_id, None)
+
+    samples = {node_id: int(math.floor(value)) for node_id, value in raw.items() if node_id in candidates}
     if not samples:
         return RoundPlan(total_samples=total_samples, rejected=rejected, strategy=strategy)
 
@@ -581,13 +714,19 @@ def plan_round(
                 fitness=round(decisions[node_id].fitness, 4),
                 tier=decisions[node_id].tier,
                 throughput_sps=round(rate, 4),
-                predicted_seconds=round(_safe_div(count, rate), 2),
+                predicted_seconds=round(fixed[node_id] + _safe_div(count, rate), 2),
+                fixed_seconds=round(fixed[node_id], 2),
+                backend=str(by_id[node_id].get("backend") or ""),
             )
         )
 
     makespan = max((a.predicted_seconds for a in assignments), default=0.0)
-    best_rate = max(rates.values()) if rates else 0.0
-    serial = _safe_div(total_samples, best_rate)
+    # The serial reference is the best single machine doing everything,
+    # including its own overhead once.
+    serial = min(
+        (fixed[node_id] + _safe_div(total_samples, rates[node_id]) for node_id in rates),
+        default=0.0,
+    )
 
     return RoundPlan(
         total_samples=total_samples,
@@ -672,18 +811,41 @@ def should_abort_round(
 # --------------------------------------------------------------------------
 
 
+def _robust_ewma(previous: float, observed: float, policy: MeshPolicy) -> float:
+    if previous <= 0:
+        return observed
+    step = max(1.0, float(policy.max_estimate_step))
+    observed = min(max(observed, previous / step), previous * step)
+    alpha = policy.throughput_ewma_alpha
+    return alpha * observed + (1.0 - alpha) * previous
+
+
 def update_throughput(
     node: dict, samples: int, seconds: float, policy: MeshPolicy = DEFAULT_POLICY
 ) -> float:
-    """EWMA of observed samples per second. Returns the new estimate."""
+    """EWMA of observed samples per second, the slope of the cost model.
+
+    `seconds` should be the training loop alone, not the round: the fixed part
+    of a round is learned separately by update_fixed, and folding it in here
+    is what made v4 read a machine that had run at 2.6 samples per second while
+    its identical, never-run twin was estimated at 37.
+    """
     if seconds <= 0 or samples <= 0:
         return float(node.get("throughput_sps") or 0.0)
-    observed = samples / seconds
-    previous = float(node.get("throughput_sps") or 0.0)
-    if previous <= 0:
-        return observed
-    alpha = policy.throughput_ewma_alpha
-    return alpha * observed + (1.0 - alpha) * previous
+    return _robust_ewma(float(node.get("throughput_sps") or 0.0), samples / seconds, policy)
+
+
+def update_fixed(node: dict, seconds: float, policy: MeshPolicy = DEFAULT_POLICY) -> float:
+    """EWMA of the per-round overhead, the intercept of the cost model.
+
+    Everything in a round that does not scale with shard size: fetching the
+    shard and the global weights, loading the model, building the trainer and
+    its data loaders, saving, and uploading the result.
+    """
+    previous = float(node.get("fixed_seconds") or 0.0)
+    if seconds <= 0:
+        return previous
+    return _robust_ewma(previous, float(seconds), policy)
 
 
 def update_reliability(node: dict, succeeded: bool, policy: MeshPolicy = DEFAULT_POLICY) -> float:
@@ -725,6 +887,7 @@ ACTIVATION_MB_PER_IMAGE_AT_640 = 340.0
 FIXED_OVERHEAD_MB = 900.0
 # Never fill a card completely: fragmentation and the display output need room.
 USABLE_MEMORY_FRACTION = 0.75
+UNIFIED_MEMORY_FRACTION = 0.55
 
 
 def safe_batch_size(
@@ -732,6 +895,7 @@ def safe_batch_size(
     imgsz: int,
     requested: int,
     node_max: Optional[int] = None,
+    unified_memory: bool = False,
 ) -> int:
     """Largest batch this device can hold, never above what was asked for.
 
@@ -744,8 +908,12 @@ def safe_batch_size(
 
     Returns at least 1. A device that cannot hold even one image is caught
     earlier by the admission gate's memory floor, not here.
+
+    Apple GPUs share memory with the operating system and every open app, so
+    the budget Metal reports is spent more conservatively there.
     """
-    budget = max(0.0, device_memory_mb * USABLE_MEMORY_FRACTION - FIXED_OVERHEAD_MB)
+    fraction = UNIFIED_MEMORY_FRACTION if unified_memory else USABLE_MEMORY_FRACTION
+    budget = max(0.0, device_memory_mb * fraction - FIXED_OVERHEAD_MB)
     per_image = ACTIVATION_MB_PER_IMAGE_AT_640 * (max(32, imgsz) / 640.0) ** 2
     affordable = int(budget // per_image) if per_image > 0 else requested
     ceiling = max(1, min(requested, affordable if affordable > 0 else 1))

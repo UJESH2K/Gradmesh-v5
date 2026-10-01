@@ -1,0 +1,7 @@
+# Apple training plane, stock macOS build with the Metal (MPS) backend.
+#
+# Apple Silicon only, macOS 14 Sonoma or newer, which is what the PyTorch 2.13
+# wheels are built for. No extra index: PyPI's macOS wheel is the Metal build.
+-r requirements-common.txt
+torch==2.13.0
+torchvision==0.28.0
