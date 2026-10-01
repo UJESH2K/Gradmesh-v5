@@ -260,7 +260,7 @@ async function main() {
   const state = readCoordinatorState();
   check(
     "Mesh token",
-    Boolean(state?.mesh_token),
+    state?.mesh_token ? "ok" : "warn",
     state?.mesh_token ? "present" : "not minted yet",
     "Start the host once with: npm run dev"
   );
@@ -351,7 +351,7 @@ async function main() {
   console.log(
     failures === 0
       ? paint("green", `Everything required checks out${warnings ? `, with ${warnings} note${warnings === 1 ? "" : "s"}` : ""}.`)
-      : paint("yellow", `${failures} item${failures === 1 ? "" : "s"} need attention.`)
+      : paint("yellow", `${failures} item${failures === 1 ? " needs" : "s need"} attention.`)
   );
   console.log(paint("gray", `Machine-local files: ${PATHS.machineDir}`));
   console.log(paint("gray", `Shared mesh state:   ${STATE_DIR}`));

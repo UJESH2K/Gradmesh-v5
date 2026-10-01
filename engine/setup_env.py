@@ -524,7 +524,7 @@ def install(
             result["blocked"] = profile.blocked
             return result
 
-        say("%s: %s" % (profile.gpu_name or "this machine", profile.reason))
+        say(profile.reason)
         for warning in profile.warnings:
             say(warning, "yellow")
 
