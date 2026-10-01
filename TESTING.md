@@ -1,0 +1,360 @@
+# Testing and benchmarking
+
+Everything needed to produce the numbers a reviewer will ask for, and an honest
+account of what this harness does not measure.
+
+Open **Testing parameters** in the dashboard sidebar. Everything below is also
+on that page, under **How to run an experiment**, so the sidebar entry is the
+only thing anybody has to find.
+
+Results from the first full sweep, and what they do and do not support, are in
+[RESULTS-LEG-1.md](RESULTS-LEG-1.md). Read it before designing the next leg: it
+records the dataset size each machine count needs, and four measurement problems
+that cost more the longer they go unfixed.
+
+---
+
+## Every parameter
+
+| Parameter | What it does | Suggested |
+|---|---|---|
+| Sweep name | Label on results and figures. Campaign legs inherit it. | `scaling-sweep` |
+| Parent dataset | The one dataset every trial draws from. Sizes are subsets of it. | 10,000+ images |
+| Dataset sizes | Training images per trial. One results row each. | `100, 1000, 10000` |
+| Machine counts | Which points on the scaling curve to measure. | all of them |
+| Partitioning arms | Capability-proportional, and equal shards as the control. | both |
+| Repeats per cell | Gives the ± in mean ± standard deviation. Each uses a different seed. | 3 minimum |
+| Rounds per trial | One local epoch each, then weights are averaged. | 5 to 10 |
+| Image size | Pixels per side. Doubling it roughly quadruples activation memory. | 640 |
+| Batch ceiling | An upper bound. Each machine gets what its memory can hold. | 8 or 16 |
+| Machine selection | Strongest-first keeps the 2-machine cell the same two machines. | strongest |
+| Network label | Tags the network. Separates lab Ethernet from a hotspot. | `college-wifi` |
+| Score every round | Measures mAP. Required for accuracy columns. Timed separately. | on |
+| Base model | Starting checkpoint. `-obb` only with oriented-box data. | `yolov8n.pt` |
+| Trial timeout | Abandons a hung trial rather than losing the night. | 3600 s |
+| Settle time | Pause between trials so GPU memory frees. | 6 s |
+| Notes | Free text, stored in `suite.json`. | — |
+
+The last four are under **Advanced settings**.
+
+### The image ladder
+
+Powers of ten, because the dataset-size axis is plotted logarithmically:
+`100, 1000, 10000`. Presets for the usual ladders sit under the field.
+
+Add a `10` rung only as a pipeline check, never as a result. Below roughly a
+thousand images the run-to-run noise is larger than the effect being measured,
+which is exactly what a 4-image COCO8 sweep demonstrated: two different requested
+sizes both clamped to 4 images and produced identical rows.
+
+**A size larger than the parent dataset is clamped to the whole of it.** Asking
+for 100 and 1000 images from a 4-image dataset gives two identical rows, not two
+data points.
+
+### How long a sweep takes
+
+Trials = *machine counts × dataset sizes × arms × repeats*, minus the
+equal-shard cells at one machine where the two arms are identical. Four machine
+counts, three sizes, two arms and three repeats is 63 trials; at five rounds each
+that is most of a day. The page shows the trial count and a duration estimate as
+you type, before you commit.
+
+---
+
+## What a sweep is
+
+A sweep is a factorial design. You choose the levels, it runs every cell the
+required number of times, and it writes results after every trial so a day of
+compute survives a crash.
+
+| Factor | Levels you choose | Why it is a factor |
+|---|---|---|
+| Machine count | 1, 2, 3 … up to what is online | The scaling curve |
+| Dataset size | 100, 1000, 10000 images | Does the mesh pay off more on bigger jobs |
+| Partitioning | capability-proportional, equal shards | The ablation that validates the core claim |
+| Repeats | 3 or more | Mean ± standard deviation, not one anecdote |
+
+Trials run strictly one at a time. Two concurrent trials would share GPUs and
+neither timing would mean anything.
+
+### Controls that make the comparison valid
+
+- **The same machines every time.** Going from four machines to two means
+  choosing which two. The default takes the strongest by measured throughput, so
+  the two-machine cell is always the same two machines and node count is the only
+  thing that varies. A seeded random policy is available for sampling the space.
+- **Subsets of one dataset, never different datasets.** A 1000-image cell is a
+  reproducible subset of the parent, stored as a list of filenames rather than a
+  copy. The **validation split never changes**, so a change in mAP is a change in
+  what was learned rather than in what was measured.
+- **A different training seed per repeat.** Ultralytics defaults to seed 0 with
+  deterministic mode on. Without varying it, three repeats return bit-identical
+  accuracy and the standard deviation is always zero. This was caught during
+  testing: three repeats gave 0.0570, 0.0570, 0.0570 before the fix and 0.0570,
+  0.0508, 0.0380 after.
+- **Evaluation is never counted as training time.** It is timed separately and
+  reported separately, so a configuration that evaluated more often does not look
+  slower for reasons unrelated to distribution.
+- **Evaluation runs on the coordinator.** Every configuration is scored by the
+  same code on the same machine against the same images. Farming it out to
+  whichever worker was idle would make accuracy depend on which GPU ran it.
+
+---
+
+## The two speedups, and which one to quote
+
+This distinction matters more than any other number in the output.
+
+**`speedup`** is wall clock on one machine divided by wall clock here, at the
+same dataset size. This is what the paper means and what a reader assumes. It is
+exactly 1.0 at one machine by construction. **Quote this one.**
+
+**`parallel_speedup`** is the sum of shard times over round wall clock. It says
+how well work was overlapped inside a round, and it sits slightly below 1 on a
+single machine because orchestration is not free. It is a diagnostic, useful for
+explaining *why* a speedup fell short. Do not quote it as speedup.
+
+Efficiency is `speedup / machines`, from the first definition.
+
+---
+
+## Running the same experiment on several networks
+
+This is what the **campaign** flow is for, and it is the cleanest network result
+you can get without administrator rights on every machine.
+
+1. Run a sweep with a network label, say `college-wifi`.
+2. When it finishes, the lab raises a **Change the network now** prompt. It says
+   what finished, how many machines are back online, and will not let the next
+   leg start under the same label.
+3. Move every machine onto the next network. Workers reconnect on their own and
+   `gradmesh.local` follows the host, so usually nothing needs retyping.
+4. Name the new network and press **Start leg 2**.
+
+The second leg copies the first leg's design exactly: same machines, same
+dataset, same subsets, same seeds, same matrix. Only `network_label` changes.
+That is what makes the two legs comparable, and it is why the next leg is started
+from the finished one rather than configured again from scratch.
+
+A cross-network table then appears with one row per leg: observed latency,
+training time, speedup, mAP and communication share, plus each leg's change
+against leg 1. Per-cell detail stays in each leg's own results, and
+`npm run report <leg-id>` builds the figures for one leg.
+
+A missing machine after a network change makes its cells **skipped**, not run
+smaller. A three-machine cell quietly run on two would silently break the
+comparison the campaign exists to make.
+
+### Getting a browser notification
+
+The prompt is an in-page banner, which always works. A desktop notification is
+attempted as well, but browsers only allow those on a secure origin, so it fires
+when you are on the host at `localhost` and not when you are on a LAN address.
+Do not rely on it.
+
+## Where to get datasets
+
+You need **one dataset large enough to subsample**, not three different ones. The
+harness derives 100, 1000 and 10000-image subsets from a single parent, which is
+what keeps the comparison valid.
+
+### The quickest route: import a standard one
+
+**Testing parameters → Standard datasets → Browse** fetches a known dataset and
+registers it, no zip and no conversion. The catalogue is deliberately short:
+
+| Dataset | Images | Download | Use it for |
+|---|---|---|---|
+| COCO8 | 8 | 1 MB | proving the pipeline runs |
+| COCO128 | 128 | 7 MB | iterating on the harness |
+| African Wildlife | 1,052 | 100 MB | a sensible first real sweep |
+| Global Wheat 2020 | 3,422 | 700 MB | up to 3000 images, one class |
+| VisDrone2019-DET | 6,471 | 2.3 GB | the full scaling ladder |
+| COCO 2017 | 118,287 | 20 GB | a headline result with published baselines |
+| DOTA v1 | 1,411 | 2 GB | oriented boxes, needs a `-obb` model |
+
+**VisDrone** is the best default here. It covers a 100 to 6000 image ladder in
+one download and has ten classes with many small objects, so the task is hard
+enough that accuracy differences are visible.
+
+### Why not ImageNet
+
+ImageNet is a **classification** dataset. The 1.28M-image ILSVRC subset has one
+label per image and no bounding boxes, so a detection model has nothing to learn
+from and there is nothing to convert. The ILSVRC **detection** subset does have
+boxes across 200 classes, but it is roughly 150 GB, ships VOC-style XML that
+needs converting to YOLO text files, and sits behind a login and a signed
+agreement, so it cannot be fetched by a script.
+
+COCO is the dataset that plays the role people usually want ImageNet for here:
+standard, citable, boxes included, and with published YOLO baselines to compare
+against. Use COCO if you want the recognisable name, VisDrone if you want the
+experiment to finish this week.
+
+### Bring your own
+
+**Roboflow Universe** (`universe.roboflow.com`) is the fastest route. Filter for
+object detection, pick a dataset with at least 10000 images, and export in
+**YOLOv8** format. It hands you a zip with `images/train`, `labels/train`,
+`images/val`, `labels/val` and a `data.yaml`, which is exactly what the upload
+expects. No conversion.
+
+Other options, roughly in order of how much work they are:
+
+| Dataset | Size | Notes |
+|---|---|---|
+| Roboflow Universe | anything | Already in YOLO format. Start here. |
+| VisDrone2019-DET | ~10k images | Ultralytics ships a converter. Good size for this sweep. |
+| Global Wheat 2020 | ~4k images | Single class, quick to train, low label noise. |
+| COCO128 / COCO8 | 128 / 8 | Ultralytics samples. Fine for a smoke test, far too small for results. |
+| DOTA v1 | ~2800 large tiles | The usual choice for oriented boxes. Tiles are huge, so expect long epochs. |
+| Full COCO | 118k | Overkill unless you have days. |
+
+If your paper is specifically about **oriented bounding boxes**, use DOTA and a
+`-obb` base model. The Intel XPU path already has an OBB trainer. Note that the
+strawberry set carried over from v3 uses standard axis-aligned boxes, so it needs
+a detection model rather than an OBB one.
+
+Practical target: **10000 or more training images and at least 500 validation
+images**. Below roughly 1000 training images the run-to-run noise is larger than
+the effect being measured, which is visible in the smoke tests in this repo.
+
+---
+
+## Running the sweep
+
+1. Get the machines on the mesh. **Discover devices** shows what is on the
+   network; each contributor pastes the one-line join command. There is no cap on
+   machine count, so six or seven is fine.
+2. Upload the parent dataset on **Datasets**.
+3. Open **Testing parameters**, choose the levels, and read the trial count and
+   estimated duration before starting. Four checkboxes separate a twenty-minute
+   sweep from an overnight one.
+4. Press **Run the sweep**. It survives a coordinator restart: reopen it and
+   press **Resume** to continue from the first trial without a result.
+
+### Getting the figures
+
+```bash
+npm run report              # most recent sweep
+npm run report <suite-id>   # a specific one
+```
+
+Six figures, each as PNG and PDF, plus `report.md` with the setup and results
+tables in markdown. Written beside `suite.json`.
+
+| Figure | Shows |
+|---|---|
+| `fig1_scaling` | Speedup and efficiency against machine count, with the linear-speedup ceiling drawn |
+| `fig2_partitioning` | The ablation: shard-time imbalance and wall clock, proportional versus equal |
+| `fig3_accuracy` | Final mAP by machine count, and the difference from the one-machine baseline |
+| `fig4_time_to_accuracy` | mAP against cumulative training time, one curve per machine count |
+| `fig5_communication` | Network share of worker time, and total bytes moved |
+| `fig6_dataset_scaling` | Wall clock against dataset size on a log axis |
+
+### Raw output
+
+Everything lands in `.gradmesh/benchmarks/<suite-id>/`:
+
+- **`suite.json`** — the complete record, and the source of truth. Every trial,
+  every round, every accuracy point, plus the full environment block.
+- **`results.csv`** — one row per trial, for a spreadsheet.
+- **`summary.csv`** — one row per cell with mean and standard deviation.
+
+The dashboard downloads all three. If a figure and the JSON disagree, the JSON is
+right and the plotting code has a bug.
+
+---
+
+## Network conditions
+
+The harness **records** network conditions, it does not **impose** them.
+
+Every trial stores the observed per-machine control-plane latency, the measured
+throughput, and the bytes transferred. The sweep carries a free-text
+`network_label`, so results gathered on lab Ethernet, on college Wi-Fi and on a
+phone hotspot stay distinguishable in one dataset.
+
+To characterise a spectrum, run the same sweep once per network and compare by
+label. That is a real experiment and it needs no special privileges.
+
+**Deliberately not implemented: traffic shaping.** Imposing 50 ms of latency or
+capping bandwidth needs `tc netem` on Linux or Clumsy on Windows, both requiring
+administrator rights, with no portable interface. Shipping a half-working version
+that silently does nothing on one platform would put fabricated conditions in a
+results table. If you need a controlled latency sweep, run `tc netem` on the
+worker machines yourself and label each sweep accordingly. The recorded latency
+in the output will show whether the shaping actually took effect.
+
+---
+
+## What this harness does not measure
+
+Being explicit here is worth more than a shaky claim. Each of these is a real gap
+against a thorough review checklist.
+
+**Time to a fixed accuracy target.** Trials run a fixed number of rounds, not
+until a target mAP. The data needed is captured: `accuracy_history` records mAP
+against cumulative training seconds per round, and `benchmark.time_to_accuracy()`
+computes the crossing. What is not automated is *stopping* at a target. State the
+fixed-round design explicitly in the paper rather than implying otherwise.
+
+**Fault-tolerance timing.** Detection and recovery work and are visible in the
+event stream, but there is no scripted fault-injection harness that kills a
+worker at 25%, 50% and 75% through a shard and reports detect and recover
+intervals separately. Doing it by hand is possible; the events carry timestamps.
+
+**Agent and coordinator resource overhead.** No CPU, memory or idle-bandwidth
+measurement for the agent, and no coordinator scaling curve against worker count.
+The claim that the agent is lightweight is currently unquantified.
+
+**Container isolation overhead.** There is no container layer, so there is
+nothing to measure. Workers run in a virtualenv under the contributor's home
+folder.
+
+**Non-NVIDIA comparison.** The capability probe is already vendor-neutral: it
+measures achieved FP32 matmul throughput and memory bandwidth rather than reading
+CUDA compute capability, so an Intel XPU device is scored on the same scale as an
+NVIDIA one, and the scheduler does not care which vendor a machine is. Apple
+Silicon via MPS is **not** wired up: `accelerator.py` handles CUDA, XPU and CPU
+only. Adding MPS is a small change to that one file, but it is untested, so treat
+cross-vendor support as covering NVIDIA and Intel today and scope Apple as future
+work rather than claiming it.
+
+**Strategy selection between communication topologies.** There is one
+communication pattern, a coordinator-mediated parameter exchange. There is no
+ring all-reduce and therefore no strategy-selection logic to validate. Do not
+claim adaptive topology selection.
+
+---
+
+## When a machine joins but never trains
+
+Two causes, both now reported rather than silent.
+
+**Its PyTorch build has no kernels for its GPU.** The tell is a machine admitted
+with a dash where its measured throughput should be, then failing every shard
+with `CUDA error: no kernel image is available`. Almost always a Blackwell card,
+the RTX 50 series, on a CUDA 12.1 build. Run `npm run doctor` there, then
+`npm run setup`. The agent now refuses to start in this state instead of joining
+and failing, and admission rejects a node whose probe measured nothing.
+
+**It fails repeatedly for some other reason.** Three consecutive shard failures
+quarantine a machine until it reconnects, so one broken contributor cannot spoil
+every round it touches. The reason appears on the Machines page.
+
+Both matter for a sweep, because a machine that joins and fails still counts
+toward the machine count you designed around, and its cells would otherwise be
+recorded as failures rather than as a hardware problem.
+
+## Disclosure block
+
+`suite.json` carries an `environment` object recorded at sweep start, and
+`report.md` renders it as a table. It contains every machine's GPU name, backend,
+memory and measured GFLOP/s, the coordinator's platform, PyTorch, CUDA and
+Ultralytics versions, the dataset name with train and validation counts and class
+names, the scheduler policy in force, and the network label.
+
+That covers the disclosure a reviewer checks before they check your numbers, with
+one exception worth adding by hand: **GPU driver versions**, which are not
+collected. Record them yourself with `nvidia-smi` on each machine.

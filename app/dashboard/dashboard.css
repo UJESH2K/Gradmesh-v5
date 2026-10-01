@@ -1,0 +1,821 @@
+.dash {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: 100vh;
+}
+
+.dash-side {
+  border-right: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.25);
+  padding: 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+.dash-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.dash-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dash-nav-label {
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding: 12px 8px 6px;
+  font-weight: 600;
+}
+
+.dash-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  font-size: 0.89rem;
+  color: var(--text-dim);
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.dash-link:hover {
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--text);
+}
+
+.dash-link.is-active {
+  background: rgba(91, 124, 250, 0.1);
+  color: var(--accent);
+}
+
+.dash-side-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.dash-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.dash-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 15px 28px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(7, 8, 11, 0.86);
+  backdrop-filter: blur(12px);
+  flex-wrap: wrap;
+}
+
+.dash-content {
+  padding: 26px 28px 60px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.page-title {
+  font-size: 1.32rem;
+  letter-spacing: -0.024em;
+  font-weight: 560;
+}
+
+/* ------------------------------------------------------------------- feed */
+
+.feed {
+  display: flex;
+  flex-direction: column;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.feed-item {
+  display: grid;
+  grid-template-columns: 62px 1fr;
+  gap: 12px;
+  padding: 9px 20px;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.84rem;
+  align-items: baseline;
+}
+
+.feed-item:last-child {
+  border-bottom: none;
+}
+
+.feed-time {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--text-faint);
+}
+
+.feed-kind {
+  font-weight: 560;
+}
+
+/* ------------------------------------------------------------------ nodes */
+
+.node-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.005));
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  transition: border-color 160ms ease;
+}
+
+.node-card.is-training {
+  border-color: rgba(52, 211, 153, 0.3);
+  background: linear-gradient(180deg, rgba(52, 211, 153, 0.045), rgba(255, 255, 255, 0.005));
+}
+
+.node-card.is-offline {
+  opacity: 0.5;
+}
+
+.node-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.node-name {
+  font-weight: 560;
+  letter-spacing: -0.012em;
+}
+
+.node-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 16px;
+  font-size: 0.81rem;
+}
+
+.node-fact {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.node-fact span:first-child {
+  color: var(--text-faint);
+}
+
+.node-fact span:last-child {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------ shards */
+
+.shard-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.2fr) 1fr 92px;
+  gap: 14px;
+  align-items: center;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.shard-row:last-child {
+  border-bottom: none;
+}
+
+.shard-track {
+  position: relative;
+  height: 20px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  overflow: hidden;
+}
+
+.shard-fill {
+  height: 100%;
+  border-radius: 6px;
+  transition: width 700ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.shard-fill.is-running {
+  background: linear-gradient(90deg, rgba(91, 124, 250, 0.9), rgba(123, 150, 255, 0.5));
+}
+.shard-fill.is-queued {
+  background: rgba(255, 255, 255, 0.12);
+}
+.shard-fill.is-done {
+  background: rgba(52, 211, 153, 0.4);
+}
+.shard-fill.is-late {
+  background: linear-gradient(90deg, rgba(245, 165, 36, 0.85), rgba(245, 165, 36, 0.4));
+}
+.shard-fill.is-lost {
+  background: linear-gradient(90deg, rgba(247, 107, 107, 0.8), rgba(247, 107, 107, 0.4));
+}
+
+.shard-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.35);
+}
+
+/* ------------------------------------------------------------------ chart */
+
+.spark {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 74px;
+}
+
+.spark-bar {
+  flex: 1;
+  min-width: 3px;
+  border-radius: 3px 3px 0 0;
+  background: linear-gradient(180deg, var(--accent), rgba(91, 124, 250, 0.25));
+  transition: height 500ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ---------------------------------------------------------------- dropzone */
+
+.dropzone {
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  padding: 34px 22px;
+  text-align: center;
+  transition: border-color 160ms ease, background 160ms ease;
+  cursor: pointer;
+}
+
+.dropzone.is-over {
+  border-color: var(--accent);
+  background: rgba(91, 124, 250, 0.06);
+}
+
+/* ---------------------------------------------------------------- responsive */
+
+@media (max-width: 980px) {
+  .dash {
+    grid-template-columns: 1fr;
+  }
+  .dash-side {
+    position: static;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+    flex-direction: row;
+    align-items: center;
+    gap: 14px;
+    overflow-x: auto;
+    padding: 12px 16px;
+  }
+  .dash-nav {
+    flex-direction: row;
+    gap: 4px;
+  }
+  .dash-nav-label,
+  .dash-side-foot {
+    display: none;
+  }
+  .dash-content,
+  .dash-topbar {
+    padding-inline: 16px;
+  }
+}
+
+/* ------------------------------------------------------------------- dock */
+
+/* Pinned indicator for whatever is training. Present on every dashboard page
+   except the training page itself, so the answer to "is it still going" is
+   never more than a glance away. */
+.dock {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 60;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid rgba(91, 124, 250, 0.35);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(20, 24, 34, 0.97), rgba(11, 13, 18, 0.97));
+  backdrop-filter: blur(14px);
+  box-shadow: 0 24px 60px -28px rgba(0, 0, 0, 1), 0 0 0 1px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  max-width: min(360px, calc(100vw - 44px));
+  animation: dock-in 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dock.is-waiting {
+  border-color: rgba(245, 165, 36, 0.4);
+}
+
+@keyframes dock-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.97);
+  }
+}
+
+.dock-body {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 13px 6px 13px 14px;
+  min-width: 0;
+  flex: 1;
+}
+
+.dock-body:hover .dock-title {
+  color: var(--accent);
+}
+
+/* Conic-gradient progress ring: no SVG, no layout, and it animates smoothly
+   because only the custom property changes. */
+.dock-ring {
+  position: relative;
+  width: 42px;
+  height: 42px;
+  flex: none;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: conic-gradient(
+    var(--accent) var(--dock-progress, 0deg),
+    rgba(255, 255, 255, 0.08) var(--dock-progress, 0deg)
+  );
+  transition: background 600ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dock-ring::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: #0b0d12;
+}
+
+.dock-ring-value {
+  position: relative;
+  z-index: 1;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.dock-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.dock-title {
+  font-size: 0.86rem;
+  font-weight: 560;
+  transition: color 140ms ease;
+}
+
+.dock-sub {
+  font-size: 0.73rem;
+  color: var(--text-faint);
+}
+
+.dock-meter {
+  display: block;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  margin-top: 3px;
+}
+
+.dock-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 600ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dock-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding: 9px 11px 9px 6px;
+  border-left: 1px solid var(--line);
+}
+
+.dock-elapsed {
+  font-size: 0.7rem;
+  color: var(--text-faint);
+}
+
+.dock-close {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 5px;
+}
+
+.dock-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+@media (max-width: 720px) {
+  .dock {
+    right: 12px;
+    bottom: 12px;
+  }
+}
+
+/* --------------------------------------------------------------- training */
+
+.train-hero {
+  display: grid;
+  grid-template-columns: minmax(240px, 380px) minmax(0, 1fr);
+  gap: 26px;
+  align-items: center;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background:
+    radial-gradient(700px 280px at 20% 0%, rgba(91, 124, 250, 0.12), transparent 70%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0.006));
+}
+
+.train-rig {
+  min-width: 0;
+}
+
+.rig {
+  position: relative;
+  width: 100%;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: radial-gradient(circle at 50% 45%, rgba(91, 124, 250, 0.1), transparent 70%);
+}
+
+.rig-canvas {
+  width: 100%;
+  height: 100%;
+}
+
+.rig-note {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  font-size: 0.64rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  opacity: 0.6;
+}
+
+.train-progress {
+  min-width: 0;
+}
+
+.train-percent {
+  font-size: clamp(2.4rem, 6vw, 3.8rem);
+  font-weight: 500;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  margin: 10px 0 18px;
+}
+
+.train-bar {
+  position: relative;
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+
+.train-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent), var(--cyan));
+  transition: width 700ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* One tick per round boundary, so the bar reads as discrete rounds rather than
+   a continuous unknown. */
+.train-bar-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(7, 8, 11, 0.65);
+}
+
+.train-state {
+  margin-top: 16px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.25);
+  font-size: 0.87rem;
+  color: var(--text-dim);
+}
+
+.train-shards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+.train-shard {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+@media (max-width: 900px) {
+  .train-hero {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ------------------------------------------------------------- testing lab */
+
+.lab-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 1180px) {
+  .lab-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Toggles for machine counts and partitioning arms. Buttons rather than
+   checkboxes because the set is small and the state has to be readable at a
+   glance while a sweep is being designed. */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.chip {
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: all 140ms ease;
+}
+
+.chip:hover {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+.chip.is-on {
+  background: rgba(91, 124, 250, 0.14);
+  border-color: rgba(91, 124, 250, 0.5);
+  color: var(--accent);
+}
+
+.suite-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.suite-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 20px;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.suite-row:last-child {
+  border-bottom: none;
+}
+
+.suite-row:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.suite-row.is-open {
+  background: rgba(91, 124, 250, 0.08);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* ----------------------------------------------------- network handoff */
+
+/* The prompt between campaign legs. Loud on purpose: a sweep finishes when
+   nobody is watching, and the next thing that has to happen is a person walking
+   over to change the Wi-Fi. */
+.handoff {
+  border: 1px solid rgba(52, 211, 153, 0.4);
+  border-radius: var(--radius-lg);
+  padding: 22px 24px;
+  background:
+    radial-gradient(600px 240px at 15% 0%, rgba(52, 211, 153, 0.12), transparent 70%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.008));
+  animation: handoff-in 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes handoff-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+}
+
+.handoff-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.handoff-steps {
+  margin: 16px 0 0;
+  padding-left: 20px;
+  color: var(--text-dim);
+  font-size: 0.88rem;
+  line-height: 1.75;
+  max-width: 620px;
+}
+
+.handoff-status {
+  margin-top: 14px;
+  font-size: 0.86rem;
+}
+
+.handoff-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+
+.handoff-actions .input {
+  max-width: 320px;
+}
+
+.campaign-block {
+  border-bottom: 1px solid var(--line);
+}
+
+.campaign-block:last-child {
+  border-bottom: none;
+}
+
+/* ------------------------------------------------------ dataset catalogue */
+
+.dataset-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 12px;
+}
+
+.dataset-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.015);
+}
+
+/* ------------------------------------------------------------------ guide */
+
+/* The runbook, on the page where the work happens. Sits above the controls so
+   the page reads as instructions first, then the thing being instructed. */
+.guide {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0.006));
+  overflow: hidden;
+}
+
+.guide-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  padding: 15px 20px;
+  background: none;
+  border: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.guide-head:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.guide-toggle {
+  font-size: 0.8rem;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.guide-body {
+  border-top: 1px solid var(--line);
+  padding: 18px 20px 20px;
+}
+
+.guide-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.guide-tab {
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  font-size: 0.83rem;
+  cursor: pointer;
+  transition: all 140ms ease;
+}
+
+.guide-tab:hover {
+  color: var(--text);
+}
+
+.guide-tab.is-on {
+  background: rgba(91, 124, 250, 0.14);
+  border-color: rgba(91, 124, 250, 0.5);
+  color: var(--accent);
+}
+
+.guide-steps {
+  margin: 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  color: var(--text-dim);
+  font-size: 0.89rem;
+  line-height: 1.65;
+}
+
+.guide-steps strong {
+  color: var(--text);
+}
+
+.guide-steps a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}

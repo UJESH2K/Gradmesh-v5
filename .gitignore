@@ -1,0 +1,34 @@
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# GradMesh runtime state: datasets, shards, run artifacts, checkpoints, tokens
+.gradmesh/
+
+# 3D assets are supplied per deployment, except the station that ships with
+# the training screen.
+public/models/*.glb
+!public/models/space-station.glb
+
+# Local training artifacts. Anchored to the repository root and the engine on
+# purpose: an unanchored `runs/` also matched app/dashboard/runs/, so every
+# fresh clone was silently missing the Training runs page.
+/runs/
+/engine/runs/
+*.pt
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
