@@ -8,7 +8,9 @@ import DatasetImporter from "./DatasetImporter";
 import SweepGuide from "./SweepGuide";
 import { Empty, Panel, StatTile } from "@/components/dashboard/ui";
 import { bytes, clock, compact, percent, seconds } from "@/lib/format";
+import { VENDORS } from "@/lib/format";
 import type {
+  Backend,
   BenchmarkIndex,
   Campaign,
   Dataset,
@@ -44,6 +46,19 @@ const SIZE_PRESETS: { label: string; sizes: number[]; note: string }[] = [
   { label: "1000 · 5000 · 10000", sizes: [1000, 5000, 10000], note: "large jobs only" },
 ];
 
+/** Hardware combinations for the cross-vendor experiment. */
+const MIX_PRESETS: { label: string; mix: Backend[] }[] = [
+  { label: "NVIDIA", mix: ["cuda"] },
+  { label: "Intel", mix: ["xpu"] },
+  { label: "Apple", mix: ["mps"] },
+  { label: "NVIDIA + Intel", mix: ["cuda", "xpu"] },
+  { label: "NVIDIA + Apple", mix: ["cuda", "mps"] },
+  { label: "Intel + Apple", mix: ["xpu", "mps"] },
+  { label: "All three", mix: ["cuda", "xpu", "mps"] },
+];
+
+const mixKey = (mix: Backend[]) => [...mix].sort().join("+");
+
 function defaultConfig(): SuiteConfig {
   return {
     name: "scaling-sweep",
@@ -53,7 +68,14 @@ function defaultConfig(): SuiteConfig {
     node_counts: [],
     strategies: ["proportional", "equal"],
     repeats: 3,
-    rounds: 5,
+    baseline_repeats: 5,
+    // Leg 1 found five rounds left 40% of every trial on cold estimates.
+    rounds: 10,
+    warmup_mode: "first-round",
+    warmup_epochs: 1,
+    optimizer: "auto",
+    worker_validation: false,
+    vendor_mixes: [],
     imgsz: 640,
     batch_size: 8,
     node_selection: "strongest",
@@ -441,6 +463,51 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
             </div>
 
             <div className="field">
+              <span className="label">Vendor mixes</span>
+              <div className="chip-row">
+                {MIX_PRESETS.map((preset) => {
+                  const mixes = config.vendor_mixes || [];
+                  const on = mixes.some((mix) => mixKey(mix) === mixKey(preset.mix));
+                  const online = preset.mix.every((backend) =>
+                    (index?.nodes || []).some((node) => node.backend === backend)
+                  );
+                  return (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      className={`chip${on ? " is-on" : ""}`}
+                      title={online ? `Trials on every online ${preset.label} machine` : `Not every vendor in ${preset.label} is online yet`}
+                      onClick={() =>
+                        patch({
+                          vendor_mixes: on
+                            ? mixes.filter((mix) => mixKey(mix) !== mixKey(preset.mix))
+                            : [...mixes, preset.mix],
+                        })
+                      }
+                    >
+                      {preset.label}
+                      {online ? "" : " ·"}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="hint">
+                {config.vendor_mixes && config.vendor_mixes.length > 0 ? (
+                  <>
+                    Each mix runs on every online machine of those vendors, against a one-machine baseline added
+                    automatically. Machine counts below are ignored while mixes are chosen. Mixes marked · have a
+                    vendor that is not online yet; their trials are skipped and recorded as such.
+                  </>
+                ) : (
+                  <>
+                    Leave empty for a node-count sweep. Choose mixes for the cross-vendor experiment: which
+                    combinations of {VENDORS.map((vendor) => vendor.name).join(", ")} machines train together.
+                  </>
+                )}
+              </p>
+            </div>
+
+            <div className="field">
               <span className="label">Machine counts</span>
               <div className="chip-row">
                 {Array.from({ length: Math.max(available, 1) }).map((_, position) => {
@@ -478,7 +545,7 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
             <div className="field">
               <span className="label">Partitioning arms</span>
               <div className="chip-row">
-                {(["proportional", "equal"] as PartitionStrategy[]).map((arm) => (
+                {(["proportional", "proportional-linear", "equal"] as PartitionStrategy[]).map((arm) => (
                   <button
                     key={arm}
                     type="button"
@@ -491,14 +558,19 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
                       })
                     }
                   >
-                    {arm === "proportional" ? "Capability-proportional" : "Equal shards (control)"}
+                    {arm === "proportional"
+                      ? "Affine (v5)"
+                      : arm === "proportional-linear"
+                        ? "Rate-proportional (v4)"
+                        : "Equal shards (control)"}
                   </button>
                 ))}
               </div>
               <p className="hint">
-                Running both arms is what turns &ldquo;proportional partitioning helps&rdquo; from a
-                claim into a measurement. Equal shards are skipped at one machine, where the two are
-                identical.
+                Running the arms side by side turns &ldquo;the scheduler helps&rdquo; from a claim into a
+                measurement. Affine sizing accounts for each machine&apos;s fixed overhead per round; the v4
+                arm sizes on rate alone; equal shards ignore capability. Only one arm runs at one machine,
+                where they are identical.
               </p>
             </div>
 
@@ -889,8 +961,14 @@ function SuiteView({
               </thead>
               <tbody>
                 {suite.cells.map((cell) => (
-                  <tr key={`${cell.node_count}-${cell.sample_count}-${cell.strategy}`}>
-                    <td className="num">{cell.node_count}</td>
+                  <tr key={`${cell.mix}-${cell.node_count}-${cell.sample_count}-${cell.strategy}`}>
+                    <td className="num">
+                      {cell.mix && cell.mix !== "any" ? (
+                        <span title={`${cell.node_count} machines`}>{cell.mix}</span>
+                      ) : (
+                        cell.node_count
+                      )}
+                    </td>
                     <td className="num">{cell.sample_count}</td>
                     <td>
                       <span className={`badge ${cell.strategy === "equal" ? "badge-warn" : "badge-accent"}`}>

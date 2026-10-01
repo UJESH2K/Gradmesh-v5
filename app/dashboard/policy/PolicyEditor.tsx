@@ -22,7 +22,7 @@ const GROUPS: Group[] = [
   {
     title: "Fitness weights",
     blurb:
-      "The scheduling score is a weighted sum of measured compute, free memory, heartbeat freshness and learned reliability, minus control-plane latency.",
+      "The scheduling score is a weighted sum of measured compute, free memory, heartbeat freshness and learned reliability, minus control-plane latency. It decides admission and backups; shard sizes come from each machine's learned overhead and rate.",
     fields: [
       { key: "w_compute", label: "Compute", help: "Measured throughput relative to the strongest device", min: 0, max: 1, step: 0.05 },
       { key: "w_memory", label: "Memory", help: "Free device memory relative to the largest device", min: 0, max: 1, step: 0.05 },
@@ -46,6 +46,7 @@ const GROUPS: Group[] = [
     fields: [
       { key: "max_shard_skew", label: "Maximum fastest to slowest ratio", help: "Caps the skew so weak machines still contribute meaningful gradients", min: 1, max: 40, step: 0.5 },
       { key: "min_shard_samples", label: "Minimum shard size", help: "Smaller shards cost more to ship than to run", min: 1, max: 200, step: 1 },
+      { key: "default_fixed_seconds", label: "Assumed overhead per round (s)", help: "Fixed cost assumed for a machine before it has been measured; replaced by the mesh's own median as soon as any machine finishes a round", min: 0, max: 120, step: 1 },
     ],
   },
   {
@@ -64,6 +65,7 @@ const GROUPS: Group[] = [
     blurb: "How fast the coordinator updates its model of each machine.",
     fields: [
       { key: "throughput_ewma_alpha", label: "Throughput smoothing", help: "Higher reacts faster to change, lower is steadier", min: 0.05, max: 1, step: 0.05 },
+      { key: "max_estimate_step", label: "Largest change per round", help: "One round may move a machine's rate or overhead estimate by at most this factor, so one noisy round cannot rewrite the next plan", min: 1, max: 10, step: 0.5 },
       { key: "reliability_reward", label: "Reliability gain per success", help: "Additive increase after a clean round", min: 0.01, max: 0.3, step: 0.01 },
       { key: "reliability_penalty", label: "Reliability loss per failure", help: "Multiplicative decrease after a failed round", min: 0.05, max: 0.9, step: 0.05 },
     ],

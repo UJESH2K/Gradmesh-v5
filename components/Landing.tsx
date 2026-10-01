@@ -22,19 +22,19 @@ const FEATURES = [
   },
   {
     title: "Shards sized to the device",
-    body: "A round costs whatever the slowest worker costs. So shards are sized in proportion to measured throughput, and every worker is predicted to finish at the same instant.",
+    body: "A round costs whatever the slowest worker costs. Each machine's fixed overhead and per-image speed are learned from its own rounds, shards are sized so every worker finishes at the same instant, and updates are averaged in proportion to the data behind them.",
   },
   {
     title: "Stragglers do not stall rounds",
     body: "Each shard carries a deadline derived from its own prediction. A soft miss clones the work onto an idle peer. A hard miss releases the barrier without it.",
   },
   {
-    title: "Aggregation that respects contribution",
-    body: "Unequal shards need weighted FedAvg. Each update is weighted by the samples behind it, damped by that worker's track record.",
+    title: "NVIDIA, Intel and Apple together",
+    body: "CUDA, Intel XPU and Apple Metal machines join the same mesh on one pinned PyTorch stack. Weights from all three average into one model, and every result is broken down by vendor.",
   },
   {
     title: "One line to contribute",
-    body: "A contributor pastes a single command. It finds their accelerator, installs the right PyTorch build, and joins. No repository to clone, no requirements to read.",
+    body: "A contributor pastes a single command. It finds their accelerator, installs the right PyTorch build, proves the GPU runs, and joins. No repository to clone, no requirements to read.",
   },
   {
     title: "Your data stays on your network",
@@ -173,8 +173,9 @@ export default function Landing({ origin, signedIn, needsFirstAccount, meshName 
 
           <p className="hero-sub" data-hero>
             The compute you need is already in the room. GradMesh finds the idle GPUs on your
-            network, measures what each one can actually do, and trains a single model across all
-            of them. One command to start. One line for anyone else to join.
+            network, NVIDIA, Intel Arc and Apple Silicon alike, measures what each one can actually
+            do, and trains a single model across all of them. One command to start. One line for
+            anyone else to join.
           </p>
 
           <div className="hero-actions" data-hero>
@@ -381,7 +382,7 @@ export default function Landing({ origin, signedIn, needsFirstAccount, meshName 
         <div className="container row-between">
           <div className="row" style={{ gap: 9 }}>
             <Logo size={18} />
-            <span>GradMesh 4</span>
+            <span>GradMesh 5</span>
           </div>
           <span className="small">
             Collaborative GPU training over an ordinary network. Research prototype.

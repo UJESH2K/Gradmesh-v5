@@ -3,7 +3,9 @@
 import Link from "next/link";
 
 import EventFeed from "@/components/dashboard/EventFeed";
+import HardwareMix from "@/components/dashboard/HardwareMix";
 import NodeCard from "@/components/dashboard/NodeCard";
+import { VendorDot } from "@/components/dashboard/VendorBadge";
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import { Empty, Meter, Panel, StatTile, StatusBadge } from "@/components/dashboard/ui";
 import { compact, gflops, memory, seconds } from "@/lib/format";
@@ -25,6 +27,11 @@ export default function Overview({ canManage }: { canManage: boolean }) {
 
   async function evict(nodeId: string) {
     await request(`/api/mesh/nodes/${nodeId}`, { method: "DELETE" }).catch(() => {});
+    await refresh();
+  }
+
+  async function reset(nodeId: string) {
+    await request(`/api/mesh/nodes/${nodeId}/reset`, { method: "POST" }).catch(() => {});
     await refresh();
   }
 
@@ -54,6 +61,17 @@ export default function Overview({ canManage }: { canManage: boolean }) {
           accent={plan.predicted_speedup > 1}
         />
       </div>
+
+      <Panel
+        title="Hardware mix"
+        action={
+          <Link className="btn btn-sm" href="/dashboard/setup">
+            Setup and health
+          </Link>
+        }
+      >
+        <HardwareMix backends={mesh.backends} />
+      </Panel>
 
       {activeRuns.length > 0 ? (
         <Panel
@@ -133,7 +151,7 @@ export default function Overview({ canManage }: { canManage: boolean }) {
             ) : (
               <div className="grid grid-2">
                 {nodes.slice(0, 6).map((node) => (
-                  <NodeCard key={node.node_id} node={node} canEvict={canManage} onEvict={evict} />
+                  <NodeCard key={node.node_id} node={node} canEvict={canManage} onEvict={evict} onReset={reset} />
                 ))}
               </div>
             )}
@@ -141,23 +159,36 @@ export default function Overview({ canManage }: { canManage: boolean }) {
 
           {admitted > 0 ? (
             <Panel title="How the next round would be split">
-              <p className="small faint" style={{ marginBottom: 16 }}>
-                Recomputed continuously from measured throughput. Every bar is sized so all machines
-                finish at the same moment.
+              <p className="small faint" style={{ marginBottom: 12 }}>
+                Recomputed continuously from what each machine has measured on{" "}
+                <span className="mono">{mesh.workload || "this workload"}</span>: a fixed overhead per round
+                plus a per-image rate. Shards are sized so every machine finishes at the same moment.
               </p>
+              <div className="row" style={{ gap: 14, marginBottom: 14 }}>
+                <span className="legend is-fixed">overhead</span>
+                <span className="legend">training</span>
+              </div>
               <div className="stack-sm" style={{ gap: 12 }}>
                 {plan.assignments.map((assignment) => {
                   const node = nodes.find((item) => item.node_id === assignment.node_id);
-                  const share = plan.total_samples ? assignment.samples / plan.total_samples : 0;
+                  const longest = Math.max(...plan.assignments.map((item) => item.predicted_seconds), 1);
+                  const fixed = Math.min(assignment.fixed_seconds ?? 0, assignment.predicted_seconds);
+                  const compute = Math.max(0, assignment.predicted_seconds - fixed);
                   return (
                     <div key={assignment.node_id} className="stack-sm" style={{ gap: 5 }}>
                       <div className="row-between small">
-                        <span className="truncate">{node?.display_name || assignment.node_id}</span>
+                        <span className="row truncate" style={{ gap: 7 }}>
+                          <VendorDot backend={assignment.backend || node?.backend} />
+                          <span className="truncate">{node?.display_name || assignment.node_id}</span>
+                        </span>
                         <span className="mono faint">
                           {assignment.samples} images · {assignment.predicted_seconds}s
                         </span>
                       </div>
-                      <Meter value={share} tone={assignment.tier === "probation" ? "warn" : "accent"} />
+                      <div className="split-bar" title={`${fixed.toFixed(1)}s overhead, ${compute.toFixed(1)}s training`}>
+                        <span className="is-fixed" style={{ width: `${(fixed / longest) * 100}%` }} />
+                        <span className="is-compute" style={{ width: `${(compute / longest) * 100}%` }} />
+                      </div>
                     </div>
                   );
                 })}

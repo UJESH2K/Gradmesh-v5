@@ -16,6 +16,7 @@ const LINKS = [
   { href: "/dashboard/policy", label: "Scheduler" },
   { href: "/dashboard/testing", label: "Testing parameters" },
   { href: "/dashboard/invite", label: "Invite a GPU" },
+  { href: "/dashboard/setup", label: "Setup and health" },
 ];
 
 export default function Sidebar({

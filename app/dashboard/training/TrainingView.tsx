@@ -6,8 +6,9 @@ import { useCallback, useEffect, useState } from "react";
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import TrainingRig, { type RigState } from "@/components/dashboard/TrainingRig";
 import EventFeed from "@/components/dashboard/EventFeed";
+import { VendorDot } from "@/components/dashboard/VendorBadge";
 import { Empty, Panel, StatTile } from "@/components/dashboard/ui";
-import { compact, percent, seconds } from "@/lib/format";
+import { compact, mixLabel, percent, seconds } from "@/lib/format";
 import type { RunDetail } from "@/lib/types";
 
 /**
@@ -96,8 +97,16 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
   const shards = run.live_shards || [];
   const finishedShards = shards.filter((shard) => shard.status === "done").length;
 
-  // Round progress plus the fraction of the current round already finished.
-  const roundFraction = shards.length > 0 ? finishedShards / shards.length : 0;
+  // Round progress plus the fraction of the current round already finished,
+  // counting the batches machines have done inside shards still running.
+  const shardFraction = (shard: (typeof shards)[number]) =>
+    shard.status === "done"
+      ? 1
+      : shard.status === "assigned" && shard.progress && shard.progress.batches > 0
+        ? Math.min(0.97, shard.progress.batch / shard.progress.batches)
+        : 0;
+  const roundFraction =
+    shards.length > 0 ? shards.reduce((sum, shard) => sum + shardFraction(shard), 0) / shards.length : 0;
   const overall = run.rounds > 0 ? Math.min(1, (run.current_round + roundFraction) / run.rounds) : 0;
 
   const running = shards.filter((shard) => shard.status === "assigned");
@@ -130,8 +139,8 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
             </span>
           </div>
           <p className="small faint" style={{ marginTop: 4 }}>
-            {run.dataset_name} · {run.base_model} · {compact(run.total_samples)} images ·{" "}
-            {run.imgsz}px
+            {run.dataset_name} · {run.base_model} · {compact(run.total_samples)} images · {run.imgsz}px ·{" "}
+            {mixLabel(run.backends || null)}
           </p>
         </div>
         <div className="row" style={{ gap: 8 }}>
@@ -229,10 +238,14 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
           <div className="train-shards">
             {shards.map((shard) => {
               const elapsed = shard.elapsed_seconds ?? 0;
+              // Real batch progress when the worker reports it, otherwise
+              // elapsed time against the shard's own prediction.
               const fraction =
                 shard.status === "done"
                   ? 1
-                  : Math.min(0.97, elapsed / Math.max(shard.predicted_seconds, 1));
+                  : shard.progress && shard.progress.batches > 0
+                    ? Math.min(0.97, shard.progress.batch / shard.progress.batches)
+                    : Math.min(0.97, elapsed / Math.max(shard.predicted_seconds, 1));
               const tone =
                 shard.status === "done"
                   ? "is-done"
@@ -247,9 +260,14 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
               return (
                 <div className="train-shard" key={shard.batch_id}>
                   <div className="row-between" style={{ gap: 10 }}>
-                    <span className="truncate small">{shard.node_name || shard.node_id}</span>
+                    <span className="row truncate small" style={{ gap: 7 }}>
+                      <VendorDot backend={shard.backend} />
+                      <span className="truncate">{shard.node_name || shard.node_id}</span>
+                      {shard.speculative ? <span className="badge badge-cyan">backup</span> : null}
+                    </span>
                     <span className="small mono faint">
-                      {shard.samples} imgs · {shard.status}
+                      {shard.samples} imgs ·{" "}
+                      {shard.status === "assigned" && shard.phase ? shard.phase : shard.status}
                     </span>
                   </div>
                   <div className="shard-track" style={{ marginTop: 7 }}>

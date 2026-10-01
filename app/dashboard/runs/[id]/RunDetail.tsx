@@ -6,7 +6,8 @@ import { useCallback, useEffect, useState } from "react";
 import EventFeed from "@/components/dashboard/EventFeed";
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import { Empty, Meter, Panel, Spark, StatTile, StatusBadge, TierBadge } from "@/components/dashboard/ui";
-import { compact, percent, seconds } from "@/lib/format";
+import VendorBadge, { VendorDot } from "@/components/dashboard/VendorBadge";
+import { bytes, compact, mixLabel, percent, seconds, vendorInfo } from "@/lib/format";
 import type { RunDetail as Run } from "@/lib/types";
 
 export default function RunDetail({ runId, canManage }: { runId: string; canManage: boolean }) {
@@ -58,6 +59,18 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
   const history = run.round_history || [];
   const live = ["running", "planning", "waiting"].includes(run.status);
   const lastRound = history.at(-1);
+  const totals = Object.entries(run.backend_totals || {});
+  const accuracy = run.accuracy_history || [];
+  const strategyLabel: Record<string, string> = {
+    proportional: "Affine (v5)",
+    "proportional-linear": "Linear (v4)",
+    equal: "Equal split",
+  };
+  const warmupLabel: Record<string, string> = {
+    "first-round": `round 1 only, ${run.warmup_epochs ?? 1} epoch${run.warmup_epochs === 1 ? "" : "s"}`,
+    none: "never",
+    "every-round": "every round (v4)",
+  };
 
   return (
     <>
@@ -117,6 +130,100 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
         />
       </div>
 
+      <div className="grid" style={{ gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)" }}>
+        <Panel title="Recipe">
+          <div className="node-facts">
+            <div className="node-fact">
+              <span>Machines</span>
+              <span>{mixLabel(run.backends || null)}</span>
+            </div>
+            <div className="node-fact">
+              <span>Shard sizing</span>
+              <span>{strategyLabel[run.partition_strategy || "proportional"] || run.partition_strategy}</span>
+            </div>
+            <div className="node-fact">
+              <span>Warmup</span>
+              <span>{warmupLabel[run.warmup_mode || "every-round"]}</span>
+            </div>
+            <div className="node-fact">
+              <span>Optimiser</span>
+              <span>
+                {run.optimizer || "auto"}
+                {run.lr0 ? `, lr ${run.lr0}` : ""}
+              </span>
+            </div>
+            <div className="node-fact">
+              <span>Seed</span>
+              <span>{run.seed ?? 0}</span>
+            </div>
+            <div className="node-fact">
+              <span>Scored each round</span>
+              <span>{run.evaluate ? "yes" : "no"}</span>
+            </div>
+            {run.reference_stack ? (
+              <div className="node-fact">
+                <span>Stack</span>
+                <span className="mono small">
+                  torch {run.reference_stack.torch} · ultralytics {run.reference_stack.ultralytics}
+                </span>
+              </div>
+            ) : null}
+            {run.comm_bytes_total ? (
+              <div className="node-fact">
+                <span>Data moved</span>
+                <span>{bytes(run.comm_bytes_total)}</span>
+              </div>
+            ) : null}
+          </div>
+        </Panel>
+
+        <Panel title="By GPU vendor">
+          {totals.length === 0 ? (
+            <Empty>Appears once the first round finishes.</Empty>
+          ) : (
+            <div className="table-scroll">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Vendor</th>
+                    <th className="num">Images</th>
+                    <th className="num">Share</th>
+                    <th className="num">Training rate</th>
+                    <th className="num">Machine time</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {totals.map(([backend, total]) => {
+                    const all = totals.reduce((sum, [, item]) => sum + item.samples, 0) || 1;
+                    return (
+                      <tr key={backend}>
+                        <td>
+                          <VendorBadge backend={backend} compact />
+                        </td>
+                        <td className="num">{compact(total.samples)}</td>
+                        <td className="num">{percent(total.samples / all)}</td>
+                        <td className="num">{total.throughput_sps ? `${total.throughput_sps.toFixed(1)} img/s` : "—"}</td>
+                        <td className="num">{seconds(total.seconds)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {accuracy.length > 0 ? (
+            <div className="stack-sm" style={{ marginTop: 16 }}>
+              <span className="eyebrow">mAP50 by round</span>
+              <Spark values={accuracy.map((point) => point.map50 ?? 0)} height={56} />
+              <span className="small faint">
+                Latest {(accuracy.at(-1)?.map50 ?? 0).toFixed(4)}, best {(run.best_map50 ?? 0).toFixed(4)}, on the
+                held-out split, scored by the coordinator.
+              </span>
+            </div>
+          ) : null}
+        </Panel>
+      </div>
+
       {run.live_shards.length > 0 ? (
         <Panel title={`Round ${run.current_round + 1} in flight`}>
           <p className="small faint" style={{ marginBottom: 16 }}>
@@ -142,10 +249,15 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
               return (
                 <div className="shard-row" key={shard.batch_id} data-tick={tick}>
                   <div style={{ minWidth: 0 }}>
-                    <div className="truncate small">{shard.node_name || shard.node_id}</div>
+                    <div className="row truncate small" style={{ gap: 6 }}>
+                      <VendorDot backend={shard.backend} />
+                      <span className="truncate">{shard.node_name || shard.node_id}</span>
+                    </div>
                     <div className="row small faint" style={{ gap: 6 }}>
                       <span className="mono">{shard.samples} images</span>
                       <TierBadge tier={shard.tier} />
+                      {shard.speculative ? <span className="badge badge-cyan">backup</span> : null}
+                      {shard.status === "assigned" && shard.phase ? <span className="phase">{shard.phase}</span> : null}
                     </div>
                   </div>
                   <div className="shard-track">
@@ -207,6 +319,7 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
                     <th className="num">Gap</th>
                     <th className="num">Aggregation</th>
                     <th className="num">Speedup</th>
+                    <th className="num">mAP50</th>
                     <th className="num">Lost</th>
                   </tr>
                 </thead>
@@ -220,6 +333,7 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
                       <td className="num">{seconds(round.straggler_gap_seconds)}</td>
                       <td className="num">{seconds(round.aggregation_seconds)}</td>
                       <td className="num accent">{round.speedup.toFixed(2)}x</td>
+                      <td className="num">{round.accuracy?.ok ? (round.accuracy.map50 ?? 0).toFixed(3) : "—"}</td>
                       <td className="num">
                         {round.dropped_shards ? (
                           <span style={{ color: "var(--danger)" }}>{round.dropped_shards}</span>
@@ -258,6 +372,7 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
                   <th className="num">Images</th>
                   <th className="num">Predicted</th>
                   <th className="num">Actual</th>
+                  <th className="num">Overhead</th>
                   <th className="num">Error</th>
                   <th style={{ width: 180 }}>Aggregation weight</th>
                 </tr>
@@ -269,10 +384,18 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
                     : 0;
                   return (
                     <tr key={shard.node_id}>
-                      <td className="truncate">{shard.node_name || shard.node_id}</td>
+                      <td className="truncate">
+                        <span className="row" style={{ gap: 7 }}>
+                          <VendorDot backend={shard.backend} />
+                          <span className="truncate" title={vendorInfo(shard.backend).name}>
+                            {shard.node_name || shard.node_id}
+                          </span>
+                        </span>
+                      </td>
                       <td className="num">{shard.samples}</td>
                       <td className="num">{seconds(shard.predicted_seconds)}</td>
                       <td className="num">{seconds(shard.seconds)}</td>
+                      <td className="num">{shard.overhead_seconds != null ? seconds(shard.overhead_seconds) : "—"}</td>
                       <td
                         className="num"
                         style={{ color: Math.abs(drift) > 0.35 ? "var(--warn)" : undefined }}

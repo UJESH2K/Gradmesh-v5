@@ -19,6 +19,11 @@ type SetupState = {
   backend: string | null;
   messages: { at: number; message: string }[];
   coordinator?: string;
+  accelerator?: "ok" | "unavailable" | null;
+  acceleratorProblem?: string | null;
+  fix?: string | null;
+  torch?: string;
+  gpu?: string | null;
 };
 
 type MeshContextValue = {
@@ -121,6 +126,19 @@ export function MeshProvider({ children }: { children: React.ReactNode }) {
       "node.offline",
       "node.left",
       "node.evicted",
+      "node.reset",
+      "node.batch_capped",
+      "node.version",
+      "run.deleted",
+      "round.evaluated",
+      "suite.created",
+      "suite.started",
+      "suite.trial",
+      "suite.finished",
+      "dataset.importing",
+      "dataset.import_failed",
+      "dataset.subset",
+      "internal.error",
       "run.created",
       "run.waiting",
       "run.stopped",

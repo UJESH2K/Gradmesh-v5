@@ -1,7 +1,14 @@
 "use client";
 
+import { vendorInfo } from "@/lib/format";
 import { useMesh } from "./MeshProvider";
 import { Empty } from "./ui";
+
+function vendorName(backend: string | undefined): string {
+  if (!backend) return "an unknown device";
+  const info = vendorInfo(backend);
+  return info.backend === "cpu" ? "CPU only" : `${info.name} (${info.api})`;
+}
 
 /**
  * A plain-language log of what the scheduler decided.
@@ -13,7 +20,23 @@ import { Empty } from "./ui";
 const RENDERERS: Record<string, (data: Record<string, any>) => string> = {
   "coordinator.ready": () => "Coordinator started.",
   "node.joined": (d) =>
-    `${d.name || d.node_id} joined on ${d.backend || "unknown"}${d.gflops ? ` at ${Math.round(d.gflops)} GFLOP/s` : ""}. ${d.reason || ""}`,
+    `${d.name || d.node_id} ${d.restarted ? "rejoined after a restart" : "joined"} on ${vendorName(d.backend)}${d.gflops ? ` at ${Math.round(d.gflops)} GFLOP/s` : ""}. ${d.reason || ""}`,
+  "node.reset": (d) => `${d.name || d.node_id} will be measured again from scratch.`,
+  "node.batch_capped": (d) => `A machine ran out of GPU memory, so its batch is now capped at ${d.batch_size}.`,
+  "node.version": (d) => `${d.name || d.node_id}: ${d.detail}`,
+  "run.deleted": () => "A run record was deleted.",
+  "round.evaluated": (d) =>
+    d.ok
+      ? `Round ${(d.round ?? 0) + 1} scored mAP50 ${Number(d.map50 ?? 0).toFixed(4)} in ${d.seconds}s.`
+      : `Scoring round ${(d.round ?? 0) + 1} failed: ${d.error}`,
+  "suite.created": (d) => `Sweep planned with ${d.trials} trials.`,
+  "suite.started": (d) => `Sweep started: ${d.trials} trials.`,
+  "suite.trial": (d) => `Sweep trial ${d.trial?.label ?? ""}: ${d.status}${d.completed != null ? ` (${d.completed}/${d.total})` : ""}.`,
+  "suite.finished": (d) => `Sweep ${d.status}${d.completed != null ? `, ${d.completed} of ${d.total} trials done` : ""}.`,
+  "dataset.importing": (d) => `Importing ${d.key}: ${d.message}`,
+  "dataset.import_failed": (d) => `Import of ${d.key} failed: ${d.error}`,
+  "dataset.subset": (d) => `Prepared a ${d.images}-image subset.`,
+  "internal.error": (d) => `Internal error in ${d.where}: ${d.error}`,
   "node.offline": (d) => `${d.name || d.node_id} stopped responding.`,
   "node.left": (d) => `${d.name || d.node_id} left the mesh.`,
   "node.evicted": (d) => `${d.name || d.node_id} was removed by the owner.`,
@@ -35,7 +58,7 @@ const RENDERERS: Record<string, (data: Record<string, any>) => string> = {
   "shard.assigned": (d) =>
     `${d.name || d.node_id} took ${d.samples} images, predicted ${d.predicted_seconds}s.`,
   "shard.completed": (d) =>
-    `${d.node_id} finished ${d.samples} images in ${d.seconds}s at ${d.throughput_sps} img/s.`,
+    `${d.node_id} finished ${d.samples} images in ${d.seconds}s${d.epoch_seconds ? ` (${d.epoch_seconds}s of it training)` : ""}.`,
   "shard.failed": (d) => `A shard failed on ${d.node_id}: ${d.error}`,
   "shard.dropped": (d) => `Shard dropped: ${d.reason}`,
   "shard.speculated": (d) =>
@@ -56,6 +79,10 @@ const TONE: Record<string, string> = {
   "run.failed": "var(--danger)",
   "round.failed": "var(--danger)",
   "supervisor.error": "var(--danger)",
+  "internal.error": "var(--danger)",
+  "dataset.import_failed": "var(--danger)",
+  "node.batch_capped": "var(--warn)",
+  "round.evaluated": "var(--cyan)",
   "shard.speculated": "var(--warn)",
   "run.waiting": "var(--warn)",
   "node.offline": "var(--warn)",

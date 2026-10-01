@@ -1,6 +1,7 @@
 import QRCode from "qrcode";
 
 import CopyLine from "./CopyLine";
+import { VENDORS } from "@/lib/format";
 
 const COORDINATOR_PORT = Number(process.env.GRADMESH_COORDINATOR_PORT || 8000);
 
@@ -50,16 +51,30 @@ export default async function JoinPanel({
         ) : null}
       </div>
 
+      <div className="grid grid-3">
+        {VENDORS.map((vendor) => (
+          <div key={vendor.backend} className="stack-sm" style={{ gap: 6 }}>
+            <span className={`vendor vendor-${vendor.vendor}`} style={{ alignSelf: "flex-start" }}>
+              <span className="vendor-dot" aria-hidden="true" />
+              {vendor.name} · {vendor.api}
+            </span>
+            <span className="small faint">{vendor.needs}</span>
+          </div>
+        ))}
+      </div>
+
       <div className="divider" />
 
       <div className="grid grid-2">
         <div className="stack-sm">
           <span className="eyebrow">What the command does</span>
           <ul className="small muted" style={{ margin: 0, paddingLeft: 18, lineHeight: 1.75 }}>
-            <li>Finds Python, and tells you how to install it if it is missing.</li>
+            <li>Finds Python 3.10 to 3.13, and on Windows offers to install it if it is missing.</li>
             <li>Creates a private environment under your home folder. Nothing else is touched.</li>
-            <li>Detects your GPU and installs the matching PyTorch build.</li>
-            <li>Measures what your device can actually do, then joins the mesh.</li>
+            <li>
+              Detects your GPU, NVIDIA, Intel Arc or Apple Silicon, and installs the matching PyTorch build.
+            </li>
+            <li>Runs a test kernel on the GPU, measures it, then joins the mesh.</li>
           </ul>
         </div>
 
@@ -92,7 +107,8 @@ export default async function JoinPanel({
             <p className="small muted">
               Clone the repository on your machine and point the worker at this host. The token
               below is what authorises a machine to receive dataset shards, so share it only with
-              people you want on the mesh.
+              people you want on the mesh. SETUP.md in the repository walks through a fully manual
+              install for every operating system and GPU vendor.
             </p>
             <CopyLine
               tone="muted"

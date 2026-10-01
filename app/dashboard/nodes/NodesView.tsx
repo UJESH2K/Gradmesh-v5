@@ -4,15 +4,17 @@ import Link from "next/link";
 import { useState } from "react";
 
 import NodeCard from "@/components/dashboard/NodeCard";
+import VendorBadge from "@/components/dashboard/VendorBadge";
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import { Empty, Panel, TierBadge } from "@/components/dashboard/ui";
-import { ago, backendLabel, gflops, memory, seconds } from "@/lib/format";
+import { ago, gflops, memory, seconds, VENDORS } from "@/lib/format";
 
 type Layout = "cards" | "table";
 
 export default function NodesView({ canManage }: { canManage: boolean }) {
   const { mesh, request, refresh } = useMesh();
   const [layout, setLayout] = useState<Layout>("cards");
+  const [vendor, setVendor] = useState<string>("all");
   const [error, setError] = useState<string | null>(null);
 
   if (!mesh) {
@@ -23,10 +25,23 @@ export default function NodesView({ canManage }: { canManage: boolean }) {
     );
   }
 
-  const nodes = [...mesh.nodes].sort((a, b) => {
-    if (a.active !== b.active) return a.active ? -1 : 1;
-    return b.fitness - a.fitness;
-  });
+  const nodes = [...mesh.nodes]
+    .filter((node) => vendor === "all" || node.backend === vendor)
+    .sort((a, b) => {
+      if (a.active !== b.active) return a.active ? -1 : 1;
+      return b.fitness - a.fitness;
+    });
+  const present = new Set(mesh.nodes.map((node) => node.backend));
+
+  async function reset(nodeId: string) {
+    setError(null);
+    try {
+      await request(`/api/mesh/nodes/${nodeId}/reset`, { method: "POST" });
+      await refresh();
+    } catch (cause) {
+      setError((cause as Error).message);
+    }
+  }
 
   async function evict(nodeId: string) {
     setError(null);
@@ -68,6 +83,29 @@ export default function NodesView({ canManage }: { canManage: boolean }) {
 
       {error ? <div className="notice notice-danger">{error}</div> : null}
 
+      {mesh.nodes.length > 0 ? (
+        <div className="chip-row" role="tablist" aria-label="Filter by GPU vendor">
+          <button type="button" className={`chip${vendor === "all" ? " is-on" : ""}`} onClick={() => setVendor("all")}>
+            All ({mesh.nodes.length})
+          </button>
+          {VENDORS.filter((item) => present.has(item.backend)).map((item) => (
+            <button
+              key={item.backend}
+              type="button"
+              className={`chip${vendor === item.backend ? " is-on" : ""}`}
+              onClick={() => setVendor(item.backend)}
+            >
+              {item.name} ({mesh.nodes.filter((node) => node.backend === item.backend).length})
+            </button>
+          ))}
+          {present.has("cpu") ? (
+            <button type="button" className={`chip${vendor === "cpu" ? " is-on" : ""}`} onClick={() => setVendor("cpu")}>
+              No GPU ({mesh.nodes.filter((node) => node.backend === "cpu").length})
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
       {nodes.length === 0 ? (
         <div className="panel">
           <Empty>
@@ -81,7 +119,7 @@ export default function NodesView({ canManage }: { canManage: boolean }) {
       ) : layout === "cards" ? (
         <div className="grid grid-3">
           {nodes.map((node) => (
-            <NodeCard key={node.node_id} node={node} canEvict={canManage} onEvict={evict} />
+            <NodeCard key={node.node_id} node={node} canEvict={canManage} onEvict={evict} onReset={reset} />
           ))}
         </div>
       ) : (
@@ -91,10 +129,11 @@ export default function NodesView({ canManage }: { canManage: boolean }) {
               <thead>
                 <tr>
                   <th>Machine</th>
-                  <th>Backend</th>
+                  <th>Vendor</th>
                   <th className="num">Measured</th>
                   <th className="num">Memory</th>
-                  <th className="num">Throughput</th>
+                  <th className="num">Rate</th>
+                  <th className="num">Overhead</th>
                   <th className="num">Fitness</th>
                   <th className="num">Reliability</th>
                   <th className="num">Rounds</th>
@@ -121,12 +160,15 @@ export default function NodesView({ canManage }: { canManage: boolean }) {
                         </div>
                       </div>
                     </td>
-                    <td className="small">{backendLabel(node.backend)}</td>
+                    <td>
+                      <VendorBadge backend={node.backend} compact />
+                    </td>
                     <td className="num">{gflops(node.capability?.gflops)}</td>
                     <td className="num">{memory(node.gpu_memory_mb)}</td>
                     <td className="num">
                       {node.throughput_sps ? `${node.throughput_sps.toFixed(1)} img/s` : "—"}
                     </td>
+                    <td className="num">{node.fixed_seconds ? seconds(node.fixed_seconds) : "—"}</td>
                     <td className="num">{node.fitness.toFixed(3)}</td>
                     <td className="num">{node.reliability.toFixed(2)}</td>
                     <td className="num">
@@ -138,7 +180,14 @@ export default function NodesView({ canManage }: { canManage: boolean }) {
                     <td>
                       <div className="stack-sm" style={{ gap: 4 }}>
                         <TierBadge tier={node.tier} title={node.admission_reason} />
-                        <span className="small faint">{node.active ? "online" : ago(node.last_seen)}</span>
+                        <span className="small faint">
+                          {node.liveness === "suspect" ? "waiting" : node.active ? "online" : ago(node.last_seen)}
+                        </span>
+                        {node.warnings?.length ? (
+                          <span className="small" style={{ color: "var(--warn)" }} title={node.warnings.join("; ")}>
+                            {node.warnings.length} warning{node.warnings.length === 1 ? "" : "s"}
+                          </span>
+                        ) : null}
                       </div>
                     </td>
                     {canManage ? (

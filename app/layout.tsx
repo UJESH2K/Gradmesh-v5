@@ -8,7 +8,7 @@ export const metadata: Metadata = {
     template: "%s · GradMesh",
   },
   description:
-    "GradMesh turns the idle GPUs already sitting on your network into a single coordinated training cluster. Share a link, contribute a GPU, train together.",
+    "GradMesh turns the idle NVIDIA, Intel and Apple GPUs already on your network into a single coordinated training cluster. Share a link, contribute a GPU, train together.",
   applicationName: "GradMesh",
   openGraph: {
     title: "GradMesh",

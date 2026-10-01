@@ -1,16 +1,55 @@
 export type Tier = "full" | "probation" | "rejected";
 
+/** cuda is NVIDIA, xpu is Intel, mps is Apple Silicon. */
+export type Backend = "cuda" | "xpu" | "mps" | "cpu";
+export type Vendor = "nvidia" | "intel" | "apple" | "cpu";
+
 export type Capability = {
   backend: string;
+  vendor?: Vendor;
   device_name: string;
   total_memory_mb: number;
+  unified_memory?: boolean;
   gflops: number;
   mem_bandwidth_gbps: number;
   host: string;
   platform: string;
   torch_version: string;
   supports_training: boolean;
+  supports_amp?: boolean;
+  compute_capability?: string | null;
 };
+
+/** What the worker reports about its host, refreshed every half minute. */
+export type HostDiagnostics = {
+  cpu?: string;
+  cpu_logical?: number;
+  cpu_physical?: number;
+  os?: string;
+  python?: string;
+  ram_mb?: number;
+  ram_available_mb?: number;
+  cpu_load?: number;
+  on_battery?: boolean;
+  battery_percent?: number;
+  power_plan?: string;
+  gpu_utilization?: number | null;
+  gpu_temperature_c?: number | null;
+  sm_clock_mhz?: number | null;
+  sm_clock_max_mhz?: number | null;
+  power_draw_w?: number | null;
+  power_limit_w?: number | null;
+  pcie_gen?: number | null;
+  pcie_gen_max?: number | null;
+  pcie_width?: number | null;
+  pcie_width_max?: number | null;
+  throttle_reasons?: string[];
+  other_gpu_processes?: number;
+  driver?: string | null;
+};
+
+/** The learned cost model for one checkpoint at one image size. */
+export type Workload = { rate: number; fixed: number; rounds: number; updated_at?: number; fixed_cold?: boolean };
 
 export type MeshNode = {
   node_id: string;
@@ -41,6 +80,22 @@ export type MeshNode = {
   fitness: number;
   tier?: Tier;
   admission_reason?: string;
+  // v5
+  vendor?: Vendor;
+  instance_id?: string | null;
+  protocol?: number;
+  liveness?: "online" | "suspect" | "offline";
+  phase?: "idle" | "downloading" | "loading" | "training" | "uploading" | null;
+  progress?: { batch: number; batches: number } | null;
+  diagnostics?: HostDiagnostics;
+  warnings?: string[];
+  co_located?: boolean;
+  dataloader_workers?: number | null;
+  fixed_seconds?: number;
+  workloads?: Record<string, Workload>;
+  workload?: string;
+  batch_cap?: number | null;
+  address?: string | null;
 };
 
 export type ShardAssignment = {
@@ -51,6 +106,9 @@ export type ShardAssignment = {
   tier: Tier;
   throughput_sps: number;
   predicted_seconds: number;
+  /** The fixed per-round part of predicted_seconds. */
+  fixed_seconds?: number;
+  backend?: string;
 };
 
 export type RoundPlan = {
@@ -60,6 +118,16 @@ export type RoundPlan = {
   predicted_makespan_seconds: number;
   predicted_serial_seconds: number;
   predicted_speedup: number;
+  predicted_imbalance?: number;
+  strategy?: PartitionStrategy;
+};
+
+export type BackendShare = {
+  workers: number;
+  samples: number;
+  seconds: number;
+  compute_seconds: number;
+  weight: number;
 };
 
 export type RoundRecord = {
@@ -75,12 +143,24 @@ export type RoundRecord = {
   serial_estimate_seconds: number;
   speedup: number;
   efficiency: number;
+  imbalance?: number;
+  predicted_imbalance?: number;
+  comm_bytes?: number;
+  comm_seconds?: number;
+  mean_overhead_seconds?: number | null;
+  speculated_shards?: number;
+  by_backend?: Record<string, BackendShare>;
+  accuracy?: { ok: boolean; map50?: number; map50_95?: number; error?: string };
   shards: {
     node_id: string;
     node_name: string | null;
+    backend?: string | null;
     samples: number;
     seconds: number;
+    compute_seconds?: number;
+    overhead_seconds?: number;
     predicted_seconds: number;
+    predicted_fixed_seconds?: number | null;
     tier: Tier;
     weight: number;
     metrics: Record<string, unknown> | null;
@@ -110,13 +190,41 @@ export type RunSummary = {
   efficiency: number;
   peak_workers: number;
   has_artifact: boolean;
+  // v5
+  partition_strategy?: PartitionStrategy;
+  backends?: Backend[] | null;
+  warmup_mode?: WarmupMode;
+  warmup_epochs?: number | null;
+  optimizer?: string;
+  lr0?: number | null;
+  worker_validation?: boolean;
+  evaluate?: boolean;
+  seed?: number;
+  map50?: number | null;
+  best_map50?: number | null;
+  accuracy_history?: { round: number; map50: number | null; map50_95: number | null; train_seconds: number }[];
+  comm_bytes_total?: number;
+  mean_imbalance?: number | null;
+  reference_stack?: Record<string, string> | null;
+  backend_totals?: Record<
+    string,
+    { samples: number; seconds: number; compute_seconds: number; rounds: number; throughput_sps: number | null }
+  >;
+  error?: string | null;
 };
+
+export type WarmupMode = "first-round" | "none" | "every-round";
 
 export type LiveShard = {
   batch_id: string;
   node_id: string;
   node_name: string | null;
-  status: "queued" | "assigned" | "done" | "failed" | "dropped";
+  status: "queued" | "assigned" | "done" | "failed" | "dropped" | "superseded";
+  backend?: string | null;
+  phase?: string | null;
+  progress?: { batch: number; batches: number } | null;
+  speculative?: boolean;
+  predicted_fixed_seconds?: number | null;
   samples: number;
   tier: Tier;
   round: number;
@@ -147,12 +255,33 @@ export type Dataset = {
   val_count: number;
   class_names: string[];
   is_default?: boolean;
+  available?: boolean;
+  source?: string;
+  is_subset?: boolean;
+  parent_id?: string;
 };
 
 export type MeshPolicy = Record<string, number>;
 
+export type BackendSummary = {
+  backend: Backend;
+  vendor: Vendor;
+  nodes: number;
+  online: number;
+  eligible: number;
+  gflops: number;
+  memory_mb: number;
+  throughput_sps: number;
+};
+
 export type MeshState = {
   mesh_name: string;
+  mesh_id?: string;
+  version?: string;
+  protocol?: number;
+  reference_stack?: Record<string, string>;
+  workload?: string;
+  backends?: BackendSummary[];
   nodes: MeshNode[];
   metrics: {
     nodes_total: number;
@@ -163,6 +292,7 @@ export type MeshState = {
     total_memory_mb: number;
     active_shards: number;
     stream_subscribers: number;
+    nodes_warned?: number;
   };
   active_runs: RunSummary[];
   plan_preview: RoundPlan;
@@ -243,7 +373,7 @@ export type DiscoverState = {
 // Benchmark suites
 // ---------------------------------------------------------------------------
 
-export type PartitionStrategy = "proportional" | "equal";
+export type PartitionStrategy = "proportional" | "proportional-linear" | "equal";
 
 export type SuiteConfig = {
   name: string;
@@ -265,6 +395,13 @@ export type SuiteConfig = {
   /** Legs of one campaign share this and differ only in network_label. */
   campaign_id: string | null;
   leg: number;
+  baseline_repeats?: number;
+  warmup_mode?: WarmupMode;
+  warmup_epochs?: number | null;
+  optimizer?: string;
+  worker_validation?: boolean;
+  /** Hardware combinations to compare, each a list of backends. */
+  vendor_mixes?: Backend[][];
 };
 
 export type TrialSpec = {
@@ -277,6 +414,8 @@ export type TrialSpec = {
   node_ids: string[];
   dataset_id: string | null;
   label: string;
+  backends?: Backend[] | null;
+  mix?: string;
 };
 
 export type TrialResult = {
@@ -286,6 +425,7 @@ export type TrialResult = {
   status: "done" | "failed" | "skipped" | "aborted";
   error: string | null;
   run_id: string | null;
+  mix?: string;
   node_count: number;
   sample_count: number;
   strategy: PartitionStrategy;
@@ -310,6 +450,7 @@ export type TrialResult = {
 };
 
 export type SuiteCell = {
+  mix?: string;
   node_count: number;
   sample_count: number;
   strategy: PartitionStrategy;

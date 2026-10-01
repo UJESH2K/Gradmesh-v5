@@ -6,7 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import { Empty, Panel, StatTile, StatusBadge } from "@/components/dashboard/ui";
-import { clock, compact, seconds } from "@/lib/format";
+import { clock, compact, mixLabel, seconds, VENDORS } from "@/lib/format";
 import type { Dataset, RunSummary } from "@/lib/types";
 
 export default function RunsView({ canManage }: { canManage: boolean }) {
@@ -20,6 +20,8 @@ export default function RunsView({ canManage }: { canManage: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [showForm, setShowForm] = useState(params.get("new") === "1");
+  // Which GPU families take part. Empty means every eligible machine.
+  const [vendors, setVendors] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     try {
@@ -44,6 +46,10 @@ export default function RunsView({ canManage }: { canManage: boolean }) {
     setCreating(true);
     setError(null);
     try {
+      const optional = (key: string) => {
+        const raw = String(formData.get(key) ?? "").trim();
+        return raw === "" ? undefined : Number(raw);
+      };
       const body = {
         name: String(formData.get("name") || "mesh-run"),
         dataset_id: String(formData.get("dataset_id") || "") || undefined,
@@ -53,6 +59,17 @@ export default function RunsView({ canManage }: { canManage: boolean }) {
         batch_size: Number(formData.get("batch_size") || 8),
         mode: String(formData.get("mode") || "mesh"),
         notes: String(formData.get("notes") || "") || undefined,
+        backends: vendors.length ? vendors : undefined,
+        partition_strategy: String(formData.get("partition_strategy") || "proportional"),
+        warmup_mode: String(formData.get("warmup_mode") || "first-round"),
+        warmup_epochs: optional("warmup_epochs"),
+        optimizer: String(formData.get("optimizer") || "auto"),
+        lr0: optional("lr0"),
+        seed: optional("seed") ?? 0,
+        evaluate: formData.get("evaluate") === "on",
+        worker_validation: formData.get("worker_validation") === "on",
+        deterministic: formData.get("deterministic") === "on",
+        dataloader_workers: optional("dataloader_workers"),
       };
       const run = await request<RunSummary>("/api/mesh/runs", {
         method: "POST",
@@ -67,7 +84,9 @@ export default function RunsView({ canManage }: { canManage: boolean }) {
     }
   }
 
-  const eligible = mesh?.plan_preview.assignments.length ?? 0;
+  const eligibleNodes = (mesh?.nodes || []).filter((node) => node.active && node.tier && node.tier !== "rejected");
+  const eligible = eligibleNodes.filter((node) => vendors.length === 0 || vendors.includes(node.backend)).length;
+  const presentVendors = VENDORS.filter((vendor) => eligibleNodes.some((node) => node.backend === vendor.backend));
   const defaultDataset = datasets.find((item) => item.is_default) || datasets[0];
   const finished = (runs || []).filter((run) => ["done", "failed", "stopped"].includes(run.status));
   const best = finished.reduce<RunSummary | null>(
@@ -103,8 +122,9 @@ export default function RunsView({ canManage }: { canManage: boolean }) {
             </div>
           ) : (
             <div className="notice notice-accent" style={{ marginBottom: 18 }}>
-              {eligible} machine{eligible === 1 ? "" : "s"} ready.
-              {mesh?.plan_preview.predicted_speedup
+              {eligible} machine{eligible === 1 ? "" : "s"} ready (
+              {mixLabel(vendors.length ? vendors : presentVendors.map((vendor) => vendor.backend))}).
+              {mesh?.plan_preview.predicted_speedup && vendors.length === 0
                 ? ` Predicted ${mesh.plan_preview.predicted_speedup.toFixed(2)}x against the best single GPU.`
                 : ""}
             </div>
@@ -202,6 +222,42 @@ export default function RunsView({ canManage }: { canManage: boolean }) {
               </div>
 
               <div className="field">
+                <span className="label">GPU vendors</span>
+                <div className="chip-row">
+                  <button
+                    type="button"
+                    className={`chip${vendors.length === 0 ? " is-on" : ""}`}
+                    onClick={() => setVendors([])}
+                  >
+                    Every eligible machine
+                  </button>
+                  {VENDORS.map((vendor) => {
+                    const on = vendors.includes(vendor.backend);
+                    const available = presentVendors.some((item) => item.backend === vendor.backend);
+                    return (
+                      <button
+                        key={vendor.backend}
+                        type="button"
+                        className={`chip${on ? " is-on" : ""}`}
+                        disabled={!available && !on}
+                        title={
+                          available ? `${vendor.name} machines only` : `No eligible ${vendor.name} machine is online`
+                        }
+                        onClick={() =>
+                          setVendors((current) =>
+                            on ? current.filter((item) => item !== vendor.backend) : [...current, vendor.backend]
+                          )
+                        }
+                      >
+                        {vendor.name}
+                      </button>
+                    );
+                  })}
+                </div>
+                <span className="hint">Restrict a run to one vendor or a mix, for cross-vendor comparisons.</span>
+              </div>
+
+              <div className="field">
                 <label className="label" htmlFor="notes">
                   Notes
                 </label>
@@ -213,6 +269,115 @@ export default function RunsView({ canManage }: { canManage: boolean }) {
                 />
               </div>
             </div>
+
+            <details className="advanced">
+              <summary>Advanced: scheduling and training recipe</summary>
+              <div className="grid grid-2" style={{ paddingBottom: 14 }}>
+                <div className="field">
+                  <label className="label" htmlFor="partition_strategy">
+                    Shard sizing
+                  </label>
+                  <select className="select" id="partition_strategy" name="partition_strategy" defaultValue="proportional">
+                    <option value="proportional">Affine (v5): overhead plus rate, finish together</option>
+                    <option value="proportional-linear">Linear (v4): proportional to rate only</option>
+                    <option value="equal">Equal split (baseline)</option>
+                  </select>
+                  <span className="hint">The last two exist for ablations.</span>
+                </div>
+                <div className="field">
+                  <label className="label" htmlFor="warmup_mode">
+                    Learning-rate warmup
+                  </label>
+                  <select className="select" id="warmup_mode" name="warmup_mode" defaultValue="first-round">
+                    <option value="first-round">Round 1 only (recommended)</option>
+                    <option value="none">Never</option>
+                    <option value="every-round">Every round (v4 behaviour)</option>
+                  </select>
+                  <span className="hint">
+                    Warming up every round keeps a one-epoch round inside warmup for good, which is why leg 1
+                    accuracy fell after round 1.
+                  </span>
+                </div>
+                <div className="field">
+                  <label className="label" htmlFor="warmup_epochs">
+                    Warmup epochs (round 1)
+                  </label>
+                  <input
+                    className="input"
+                    id="warmup_epochs"
+                    name="warmup_epochs"
+                    type="number"
+                    min={0}
+                    max={10}
+                    step={0.5}
+                    defaultValue={1}
+                  />
+                </div>
+                <div className="field">
+                  <label className="label" htmlFor="optimizer">
+                    Optimiser
+                  </label>
+                  <select className="select" id="optimizer" name="optimizer" defaultValue="auto">
+                    <option value="auto">Ultralytics auto (AdamW for round-sized jobs)</option>
+                    <option value="AdamW">AdamW</option>
+                    <option value="Adam">Adam</option>
+                    <option value="SGD">SGD</option>
+                  </select>
+                  <span className="hint">Identical on every vendor.</span>
+                </div>
+                <div className="field">
+                  <label className="label" htmlFor="lr0">
+                    Learning rate
+                  </label>
+                  <input
+                    className="input"
+                    id="lr0"
+                    name="lr0"
+                    type="number"
+                    min={0}
+                    max={1}
+                    step="any"
+                    placeholder="automatic"
+                  />
+                  <span className="hint">Used with an explicit optimiser.</span>
+                </div>
+                <div className="field">
+                  <label className="label" htmlFor="seed">
+                    Seed
+                  </label>
+                  <input className="input" id="seed" name="seed" type="number" min={0} defaultValue={0} />
+                </div>
+                <div className="field">
+                  <label className="label" htmlFor="dataloader_workers">
+                    Dataloader processes per machine
+                  </label>
+                  <input
+                    className="input"
+                    id="dataloader_workers"
+                    name="dataloader_workers"
+                    type="number"
+                    min={0}
+                    max={16}
+                    placeholder="each machine decides"
+                  />
+                  <span className="hint">Windows machines use 0 unless set here.</span>
+                </div>
+                <div className="stack-sm">
+                  <label className="row small" style={{ gap: 8 }}>
+                    <input type="checkbox" name="evaluate" defaultChecked />
+                    Score the global model every round (mAP on the held-out split)
+                  </label>
+                  <label className="row small" style={{ gap: 8 }}>
+                    <input type="checkbox" name="deterministic" defaultChecked />
+                    Deterministic kernels (reproducible, slightly slower)
+                  </label>
+                  <label className="row small" style={{ gap: 8 }}>
+                    <input type="checkbox" name="worker_validation" />
+                    Also validate on every worker (slower; v4 behaviour)
+                  </label>
+                </div>
+              </div>
+            </details>
 
             <div className="row">
               <button className="btn btn-primary" type="submit" disabled={creating || eligible === 0}>
@@ -265,6 +430,7 @@ export default function RunsView({ canManage }: { canManage: boolean }) {
                   <th className="num">Machines</th>
                   <th className="num">Wall clock</th>
                   <th className="num">Speedup</th>
+                  <th className="num">mAP50</th>
                   <th className="num">Started</th>
                   <th />
                 </tr>
@@ -283,13 +449,17 @@ export default function RunsView({ canManage }: { canManage: boolean }) {
                     <td>
                       <StatusBadge status={run.status} />
                     </td>
-                    <td className="small">{run.mode === "solo" ? "Single GPU" : "Mesh"}</td>
+                    <td className="small">
+                      {run.mode === "solo" ? "Single GPU" : "Mesh"}
+                      <div className="faint">{mixLabel(run.backends || null)}</div>
+                    </td>
                     <td className="num">
                       {run.current_round} / {run.rounds}
                     </td>
                     <td className="num">{run.peak_workers || "—"}</td>
                     <td className="num">{seconds(run.wall_clock_seconds)}</td>
                     <td className="num accent">{run.speedup ? `${run.speedup.toFixed(2)}x` : "—"}</td>
+                    <td className="num">{run.map50 != null ? run.map50.toFixed(3) : "—"}</td>
                     <td className="num small faint">{clock(run.created_at)}</td>
                     <td className="num">
                       {run.has_artifact ? (

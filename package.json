@@ -1,8 +1,8 @@
 {
   "name": "gradmesh",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "private": true,
-  "description": "Turn every GPU on your network into one training cluster.",
+  "description": "Turn every NVIDIA, Intel and Apple GPU on your network into one training cluster.",
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "setup": "node scripts/bootstrap.mjs",
@@ -13,7 +13,9 @@
     "doctor": "node scripts/doctor.mjs",
     "test:scheduler": "node scripts/test-scheduler.mjs",
     "report": "node scripts/report.mjs",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test": "node scripts/test.mjs",
+    "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
     "gsap": "3.12.5",

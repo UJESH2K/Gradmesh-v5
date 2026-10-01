@@ -29,6 +29,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -109,7 +110,7 @@ def _to_local(value: Optional[str]) -> Optional[str]:
     # A v4 record with an absolute path from another machine or user. If the
     # same relative location exists under this state directory, use that.
     marker = "/.gradmesh/"
-    normalised = value.replace("\\", "/")
+    normalised = re.sub(r"/+", "/", value.replace("\\", "/"))
     if marker in normalised and not Path(value).exists():
         candidate = STATE_DIR / normalised.split(marker, 1)[1]
         if candidate.exists():

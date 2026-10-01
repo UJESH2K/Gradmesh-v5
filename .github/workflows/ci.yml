@@ -1,0 +1,33 @@
+name: CI
+
+# Everything that can be checked without a GPU: build-selection rules for every
+# vendor, the scheduler's claims, portable state, the dashboard's types and its
+# production build. On all three operating systems, because "works on the next
+# machine" is the property GradMesh 5 is built around.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: npm test -- --full
+      - run: python engine/hardware.py
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"

@@ -58,13 +58,66 @@ export function clock(timestampSeconds: number | null | undefined): string {
   });
 }
 
-const BACKEND_LABELS: Record<string, string> = {
-  cuda: "NVIDIA CUDA",
-  xpu: "Intel XPU",
-  cpu: "CPU",
+export type VendorInfo = {
+  backend: "cuda" | "xpu" | "mps" | "cpu";
+  vendor: "nvidia" | "intel" | "apple" | "cpu";
+  /** The company, as a person would say it. */
+  name: string;
+  /** The PyTorch backend that drives it. */
+  api: string;
+  /** What to install so a machine of this kind can join. */
+  needs: string;
 };
+
+/** The three GPU families GradMesh 5 trains on, in the order they are listed everywhere. */
+export const VENDORS: VendorInfo[] = [
+  {
+    backend: "cuda",
+    vendor: "nvidia",
+    name: "NVIDIA",
+    api: "CUDA",
+    needs: "GeForce GTX 900 or newer on Windows or Linux, with the NVIDIA driver installed.",
+  },
+  {
+    backend: "xpu",
+    vendor: "intel",
+    name: "Intel",
+    api: "XPU",
+    needs: "Arc A or B series, or a Core Ultra with Arc Graphics, on Windows or Linux with Intel's graphics driver.",
+  },
+  {
+    backend: "mps",
+    vendor: "apple",
+    name: "Apple",
+    api: "Metal",
+    needs: "Any Apple Silicon Mac (M1 or later) on macOS 14 Sonoma or newer.",
+  },
+];
+
+const CPU_INFO: VendorInfo = {
+  backend: "cpu",
+  vendor: "cpu",
+  name: "CPU",
+  api: "CPU",
+  needs: "Joins and is measured, but receives no training work.",
+};
+
+export function vendorInfo(backend: string | undefined | null): VendorInfo {
+  return VENDORS.find((item) => item.backend === backend) ?? CPU_INFO;
+}
 
 export function backendLabel(backend: string | undefined): string {
   if (!backend) return "Unknown";
-  return BACKEND_LABELS[backend] || backend.toUpperCase();
+  const info = vendorInfo(backend);
+  return info.backend === "cpu" && backend !== "cpu" ? backend.toUpperCase() : `${info.name} ${info.api}`;
+}
+
+/** "NVIDIA+Intel+Apple" for a list of backends. */
+export function mixLabel(backends: string[] | null | undefined): string {
+  if (!backends || backends.length === 0) return "Any GPU";
+  const order = ["cuda", "xpu", "mps", "cpu"];
+  return [...new Set(backends)]
+    .sort((a, b) => order.indexOf(a) - order.indexOf(b))
+    .map((backend) => vendorInfo(backend).name)
+    .join(" + ");
 }
