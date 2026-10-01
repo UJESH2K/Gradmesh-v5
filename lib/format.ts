@@ -121,3 +121,19 @@ export function mixLabel(backends: string[] | null | undefined): string {
     .map((backend) => vendorInfo(backend).name)
     .join(" + ");
 }
+
+/**
+ * Wall clock for a run: time since it started while it is live, the sum of its
+ * rounds once it has finished. Summing rounds alone reads "0 ms" for the whole
+ * first round of a live run.
+ */
+export function runElapsed(run: {
+  status: string;
+  wall_clock_seconds: number;
+  started_at?: number;
+  created_at: number;
+}): number {
+  const live = ["running", "planning", "waiting"].includes(run.status);
+  if (!live) return run.wall_clock_seconds;
+  return Math.max(run.wall_clock_seconds, Date.now() / 1000 - (run.started_at ?? run.created_at));
+}

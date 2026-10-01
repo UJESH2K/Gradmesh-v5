@@ -49,7 +49,7 @@ const RENDERERS: Record<string, (data: Record<string, any>) => string> = {
   "run.stopped": () => "Run stopped by the owner.",
   "run.failed": (d) => `Run failed: ${d.error}`,
   "run.completed": (d) =>
-    `Run finished with ${d.summary?.speedup ?? "?"}x speedup over a single GPU estimate.`,
+    `Run "${d.summary?.name ?? ""}" finished: ${d.summary?.rounds ?? "?"} rounds in ${d.summary?.wall_clock_seconds ?? "?"}s on ${d.summary?.peak_workers ?? "?"} machine${d.summary?.peak_workers === 1 ? "" : "s"}${d.summary?.map50 != null ? `, mAP50 ${Number(d.summary.map50).toFixed(3)}` : ""}.`,
   "round.started": (d) =>
     `Round ${(d.round ?? 0) + 1} planned across ${d.plan?.assignments?.length ?? 0} machines, ${d.plan?.total_samples ?? 0} images, predicted ${d.plan?.predicted_makespan_seconds ?? "?"}s.`,
   "round.completed": (d) =>
@@ -58,8 +58,8 @@ const RENDERERS: Record<string, (data: Record<string, any>) => string> = {
   "shard.assigned": (d) =>
     `${d.name || d.node_id} took ${d.samples} images, predicted ${d.predicted_seconds}s.`,
   "shard.completed": (d) =>
-    `${d.node_id} finished ${d.samples} images in ${d.seconds}s${d.epoch_seconds ? ` (${d.epoch_seconds}s of it training)` : ""}.`,
-  "shard.failed": (d) => `A shard failed on ${d.node_id}: ${d.error}`,
+    `${d.name || d.node_id} finished ${d.samples} images in ${d.seconds}s${d.epoch_seconds ? ` (${d.epoch_seconds}s of it training)` : ""}.`,
+  "shard.failed": (d) => `A shard failed on ${d.name || d.node_id}: ${d.error}`,
   "shard.dropped": (d) => `Shard dropped: ${d.reason}`,
   "shard.speculated": (d) =>
     `${d.from_node} passed its soft deadline at ${d.elapsed_seconds}s, so a copy was started on ${d.to_node}.`,

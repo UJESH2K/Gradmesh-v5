@@ -8,7 +8,7 @@ import TrainingRig, { type RigState } from "@/components/dashboard/TrainingRig";
 import EventFeed from "@/components/dashboard/EventFeed";
 import { VendorDot } from "@/components/dashboard/VendorBadge";
 import { Empty, Panel, StatTile } from "@/components/dashboard/ui";
-import { compact, mixLabel, percent, seconds } from "@/lib/format";
+import { compact, mixLabel, percent, runElapsed, seconds } from "@/lib/format";
 import type { RunDetail } from "@/lib/types";
 
 /**
@@ -99,12 +99,17 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
 
   // Round progress plus the fraction of the current round already finished,
   // counting the batches machines have done inside shards still running.
+  // One estimate for both the overall bar and each machine's bar: real batch
+  // progress when the worker reports it, otherwise elapsed time against the
+  // shard's own prediction.
   const shardFraction = (shard: (typeof shards)[number]) =>
     shard.status === "done"
       ? 1
-      : shard.status === "assigned" && shard.progress && shard.progress.batches > 0
-        ? Math.min(0.97, shard.progress.batch / shard.progress.batches)
-        : 0;
+      : shard.status !== "assigned"
+        ? 0
+        : shard.progress && shard.progress.batches > 0
+          ? Math.min(0.97, shard.progress.batch / shard.progress.batches)
+          : Math.min(0.97, (shard.elapsed_seconds ?? 0) / Math.max(shard.predicted_seconds, 1));
   const roundFraction =
     shards.length > 0 ? shards.reduce((sum, shard) => sum + shardFraction(shard), 0) / shards.length : 0;
   const overall = run.rounds > 0 ? Math.min(1, (run.current_round + roundFraction) / run.rounds) : 0;
@@ -188,7 +193,7 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
               Round {Math.min(run.current_round + 1, run.rounds)} of {run.rounds}
             </span>
             <span data-tick={tick}>
-              {live ? `${seconds(run.wall_clock_seconds)} elapsed` : "finished"}
+              {live ? `${seconds(runElapsed(run))} elapsed` : `finished in ${seconds(run.wall_clock_seconds)}`}
             </span>
           </div>
 
@@ -216,7 +221,7 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
         />
         <StatTile
           label="Machines"
-          value={run.peak_workers || shards.length || 0}
+          value={Math.max(run.peak_workers || 0, run.live_workers || 0) || shards.length || 0}
           foot="contributing to this run"
           accent={running.length > 0}
         />
@@ -238,14 +243,7 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
           <div className="train-shards">
             {shards.map((shard) => {
               const elapsed = shard.elapsed_seconds ?? 0;
-              // Real batch progress when the worker reports it, otherwise
-              // elapsed time against the shard's own prediction.
-              const fraction =
-                shard.status === "done"
-                  ? 1
-                  : shard.progress && shard.progress.batches > 0
-                    ? Math.min(0.97, shard.progress.batch / shard.progress.batches)
-                    : Math.min(0.97, elapsed / Math.max(shard.predicted_seconds, 1));
+              const fraction = shardFraction(shard);
               const tone =
                 shard.status === "done"
                   ? "is-done"
@@ -267,7 +265,11 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
                     </span>
                     <span className="small mono faint">
                       {shard.samples} imgs ·{" "}
-                      {shard.status === "assigned" && shard.phase ? shard.phase : shard.status}
+                      {shard.status === "assigned"
+                        ? shard.phase && shard.phase !== "idle"
+                          ? shard.phase
+                          : "starting"
+                        : shard.status}
                     </span>
                   </div>
                   <div className="shard-track" style={{ marginTop: 7 }}>

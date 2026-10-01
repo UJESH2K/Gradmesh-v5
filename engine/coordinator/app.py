@@ -928,6 +928,7 @@ def _accept_result(batch_id: str, node_id: str, round_index: int, weights: bytes
         # needs.
         _supersede_twins_locked(batch)
         run_id = run["id"] if run else None
+        node_name = (node or {}).get("display_name")
 
     emit(
         "shard.completed",
@@ -935,6 +936,7 @@ def _accept_result(batch_id: str, node_id: str, round_index: int, weights: bytes
             "run_id": run_id,
             "batch_id": batch_id,
             "node_id": node_id,
+            "name": node_name,
             "round": round_index,
             "seconds": round(elapsed, 2),
             "samples": batch["samples"],
@@ -1994,13 +1996,26 @@ def _run_summary(run: dict) -> dict:
     latest = accuracy[-1] if accuracy else None
     best = max((item.get("map50") or 0.0 for item in accuracy), default=0.0)
     imbalances = [item.get("imbalance", 0.0) for item in history if item.get("imbalance") is not None]
+    # Machines holding a shard of the current round right now. Rounds that
+    # finished are counted in peak_workers; this is the live number a person
+    # watching a run wants, before the first round has finished.
+    with state_lock:
+        live_workers = len(
+            {
+                batch["node_id"]
+                for batch in batches.values()
+                if batch["run_id"] == run["id"] and batch["status"] in {"queued", "assigned"}
+            }
+        )
     return {
         "id": run["id"],
         "name": run["name"],
         "status": run["status"],
         "mode": run["mode"],
         "created_at": run["created_at"],
+        "started_at": run.get("started_at") or run["created_at"],
         "finished_at": run.get("finished_at"),
+        "live_workers": live_workers,
         "dataset_id": run["dataset_id"],
         "dataset_name": run["dataset_name"],
         "base_model": run["base_model"],

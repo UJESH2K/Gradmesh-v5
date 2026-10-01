@@ -7,7 +7,7 @@ import EventFeed from "@/components/dashboard/EventFeed";
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import { Empty, Meter, Panel, Spark, StatTile, StatusBadge, TierBadge } from "@/components/dashboard/ui";
 import VendorBadge, { VendorDot } from "@/components/dashboard/VendorBadge";
-import { bytes, compact, mixLabel, percent, seconds, vendorInfo } from "@/lib/format";
+import { bytes, compact, mixLabel, percent, runElapsed, seconds, vendorInfo } from "@/lib/format";
 import type { RunDetail as Run } from "@/lib/types";
 
 export default function RunDetail({ runId, canManage }: { runId: string; canManage: boolean }) {
@@ -60,6 +60,7 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
   const live = ["running", "planning", "waiting"].includes(run.status);
   const lastRound = history.at(-1);
   const totals = Object.entries(run.backend_totals || {});
+  const machines = Math.max(run.peak_workers || 0, run.live_workers || 0);
   const accuracy = run.accuracy_history || [];
   const strategyLabel: Record<string, string> = {
     proportional: "Affine (v5)",
@@ -116,7 +117,11 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
           value={`${run.current_round} / ${run.rounds}`}
           foot="rounds completed"
         />
-        <StatTile label="Wall clock" value={seconds(run.wall_clock_seconds)} foot="across all rounds" />
+        <StatTile
+          label="Wall clock"
+          value={seconds(runElapsed(run))}
+          foot={live ? "since the run started" : "across all rounds"}
+        />
         <StatTile
           label="Speedup"
           value={run.speedup ? `${run.speedup.toFixed(2)}x` : "—"}
@@ -126,7 +131,7 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
         <StatTile
           label="Efficiency"
           value={run.efficiency ? percent(run.efficiency) : "—"}
-          foot={`over ${run.peak_workers || 0} machines`}
+          foot={`over ${machines} machine${machines === 1 ? "" : "s"}`}
         />
       </div>
 
@@ -257,7 +262,9 @@ export default function RunDetail({ runId, canManage }: { runId: string; canMana
                       <span className="mono">{shard.samples} images</span>
                       <TierBadge tier={shard.tier} />
                       {shard.speculative ? <span className="badge badge-cyan">backup</span> : null}
-                      {shard.status === "assigned" && shard.phase ? <span className="phase">{shard.phase}</span> : null}
+                      {shard.status === "assigned" ? (
+                        <span className="phase">{shard.phase && shard.phase !== "idle" ? shard.phase : "starting"}</span>
+                      ) : null}
                     </div>
                   </div>
                   <div className="shard-track">

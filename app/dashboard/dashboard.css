@@ -508,8 +508,8 @@
 
 .rig-note {
   position: absolute;
-  left: 10px;
-  bottom: 8px;
+  left: 12px;
+  top: 10px;
   font-size: 0.62rem;
   letter-spacing: 0.06em;
   color: var(--text-faint);
@@ -1001,4 +1001,9 @@
   .mix-grid {
     grid-template-columns: 1fr;
   }
+}
+
+.chip:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
 }

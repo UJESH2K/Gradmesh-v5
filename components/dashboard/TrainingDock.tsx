@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { useMesh } from "./MeshProvider";
-import { seconds } from "@/lib/format";
+import { runElapsed, seconds } from "@/lib/format";
 
 /**
  * The always-present handle on whatever is training.
@@ -34,6 +34,7 @@ export default function TrainingDock() {
   if (pathname.startsWith("/dashboard/training")) return null;
 
   const progress = run.rounds > 0 ? run.current_round / run.rounds : 0;
+  const machines = Math.max(run.live_workers || 0, run.peak_workers || 0);
   const waiting = run.status === "waiting";
 
   return (
@@ -48,7 +49,7 @@ export default function TrainingDock() {
           <span className="dock-sub truncate">
             {waiting
               ? "Waiting for a machine"
-              : `Round ${Math.min(run.current_round + 1, run.rounds)} of ${run.rounds} · ${run.peak_workers || 0} machine${run.peak_workers === 1 ? "" : "s"}`}
+              : `Round ${Math.min(run.current_round + 1, run.rounds)} of ${run.rounds} · ${machines} machine${machines === 1 ? "" : "s"}`}
           </span>
           <span className="dock-meter">
             <span className="dock-meter-fill" style={{ width: `${progress * 100}%` }} />
@@ -57,7 +58,7 @@ export default function TrainingDock() {
       </Link>
 
       <div className="dock-side">
-        <span className="dock-elapsed mono">{seconds(run.wall_clock_seconds)}</span>
+        <span className="dock-elapsed mono">{seconds(runElapsed(run))}</span>
         <button
           type="button"
           className="dock-close"

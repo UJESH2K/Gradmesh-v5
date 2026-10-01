@@ -1068,8 +1068,16 @@ class Agent:
     def report_failure(self, batch: dict, exc: Exception) -> None:
         message = "%s: %s" % (type(exc).__name__, exc)
         lowered = message.lower()
-        if "out of memory" in lowered or "outofmemory" in lowered:
-            message = "out of memory at batch %s: %s" % (batch.get("batch_size"), message)
+        if isinstance(exc, MemoryError) or "insufficient memory" in lowered or "unable to allocate" in lowered:
+            # System RAM, not the GPU. The coordinator still halves the batch
+            # (fewer decoded images in flight helps), but the fix the person
+            # at this machine needs is different, so say which memory ran out.
+            message = (
+                "out of memory (system RAM, not GPU) at batch %s: close other applications on this machine. %s"
+                % (batch.get("batch_size"), message)
+            )
+        elif "out of memory" in lowered or "outofmemory" in lowered:
+            message = "out of memory (GPU) at batch %s: %s" % (batch.get("batch_size"), message)
         log("shard %s failed: %s" % (batch.get("shard_index"), message[:400]))
         try:
             self.client.call(

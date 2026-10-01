@@ -191,6 +191,9 @@ export type RunSummary = {
   peak_workers: number;
   has_artifact: boolean;
   // v5
+  started_at?: number;
+  /** Machines holding a shard of the current round right now. */
+  live_workers?: number;
   partition_strategy?: PartitionStrategy;
   backends?: Backend[] | null;
   warmup_mode?: WarmupMode;
