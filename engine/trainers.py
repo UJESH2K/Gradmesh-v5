@@ -36,7 +36,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -94,9 +94,33 @@ def install_patches() -> None:
 
 
 class _LeanMixin:
-    """Skip per-round validation on the worker when the run asks for that."""
+    """What a one-epoch federated round needs from the Ultralytics trainer.
+
+    * Optional per-round validation (see the module docstring).
+    * Every gradient counts. Ultralytics accumulates gradients up to a nominal
+      batch of 64 images and steps the optimiser only when it gets there, so
+      with a batch of 8 it steps every 8 batches. A round that ends between
+      steps throws the accumulated gradients away, and a shard of fewer than
+      eight batches never steps at all: the worker trains, the weights do not
+      move, and the mesh averages unchanged models. Found in v5 testing on a
+      56-image shard; in leg 1 it silenced every two-machine 100-image trial.
+      `flush_gradients` applies whatever is pending at the end of the epoch.
+    * A count of optimiser steps, reported with the round, so a round that
+      could not learn anything is visible rather than silent.
+    """
 
     gradmesh_validate = False
+    gradmesh_steps = 0
+
+    def optimizer_step(self):  # type: ignore[override]
+        self.gradmesh_steps = getattr(self, "gradmesh_steps", 0) + 1
+        return super().optimizer_step()
+
+    def flush_gradients(self) -> bool:
+        pending = any(parameter.grad is not None for parameter in self.model.parameters())
+        if pending:
+            self.optimizer_step()
+        return pending
 
     def validate(self):  # type: ignore[override]
         if self.gradmesh_validate:
@@ -148,19 +172,37 @@ def trainer_class(backend: str, task: str, validate: bool):
 def default_dataloader_workers(accelerator: Accelerator) -> int:
     """How many dataloader processes this machine should use.
 
-    v3 and v4 used zero everywhere, which puts JPEG decoding and mosaic
-    augmentation on the training process's own thread. On a fast GPU that, not
-    the GPU, sets the pace, and it is one reason two identical cards in
-    different machines train at different speeds: the CPUs are not identical.
-    Ultralytics forces zero on MPS and CPU itself.
+    Zero puts JPEG decoding and mosaic augmentation on the training process's
+    own thread. On a fast GPU that, not the GPU, sets the pace, and it is one
+    reason two identical cards in different machines train at different
+    speeds: the CPUs are not identical. More workers help, where they work.
+
+    They do not work reliably on Windows. Windows spawns rather than forks, so
+    every loader process imports PyTorch afresh and maps its CUDA libraries,
+    a few gigabytes of committed memory each. On a laptop with little free
+    memory that fails outright with "the paging file is too small", which is
+    almost certainly why v3 settled on zero. Windows keeps zero unless a run or
+    the --workers flag asks otherwise; elsewhere the count follows the CPU and
+    the free memory. Ultralytics forces zero on MPS and CPU itself.
     """
-    if accelerator.backend in {"mps", "cpu"}:
+    if accelerator.backend in {"mps", "cpu"} or os.name == "nt":
         return 0
     cpus = os.cpu_count() or 2
-    # Windows spawns workers rather than forking, which costs a second or two
-    # each per round, so it gets fewer.
-    ceiling = 4 if os.name == "nt" else 8
-    return max(0, min(ceiling, cpus // 2 - 1))
+    by_cpu = max(0, min(8, cpus // 2 - 1))
+    try:
+        import psutil
+
+        # Roughly 1.5 GB per forked loader once a batch of mosaics is in flight.
+        by_memory = int(psutil.virtual_memory().available / (1.5 * 2**30))
+    except Exception:
+        by_memory = by_cpu
+    return max(0, min(by_cpu, by_memory))
+
+
+def is_loader_crash(error: BaseException) -> bool:
+    """Did a dataloader process die, rather than the training itself fail?"""
+    text = "%s: %s" % (type(error).__name__, error)
+    return "DataLoader worker" in text or "paging file" in text or "WinError 1455" in text
 
 
 def train_round(
@@ -170,12 +212,21 @@ def train_round(
     *,
     validate: bool = False,
     on_progress: Optional[Callable[[dict], None]] = None,
-) -> Dict[str, float]:
-    """Train `model` in place for one round. Returns phase timings in seconds.
+    flush_gradients: bool = True,
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """Train `model` for one round. Returns (timings, weights).
 
     `options` are Ultralytics train arguments shared by every backend:
     data, epochs, imgsz, batch, project, name, workers, seed, optimizer, lr0,
     warmup_epochs, deterministic. Device-specific arguments are added here.
+
+    The weights are the trainer's EMA model in full precision, on CPU. v3 and
+    v4 sent `model.model.state_dict()` after `model.train()` returned, which
+    is the best.pt checkpoint Ultralytics reloads at the end, and Ultralytics
+    saves checkpoints in half precision. Every round therefore rounded the
+    whole model to fp16 before averaging, erasing any update smaller than
+    fp16 resolution, round after round. The in-memory EMA is the same model
+    without that rounding.
     """
     install_patches()
     if accelerator.backend == "xpu":
@@ -200,8 +251,15 @@ def train_round(
             # Throttled by the caller; cheap to call per batch.
             on_progress({"batch": state["batch"], "batches": state["batches"]})
 
+    def flush(trainer) -> None:
+        if flush_gradients and hasattr(trainer, "flush_gradients"):
+            state["flushed"] = bool(trainer.flush_gradients())
+
     model.add_callback("on_pretrain_routine_end", mark("setup_end"))
     model.add_callback("on_train_epoch_start", mark("epoch_start"))
+    # Order matters: flush before the epoch-end mark, so the extra optimiser
+    # step is timed as training, and before Ultralytics saves the checkpoint.
+    model.add_callback("on_train_epoch_end", flush)
     model.add_callback("on_train_epoch_end", mark("epoch_end"))
     model.add_callback("on_train_batch_end", batch_end)
 
@@ -224,6 +282,14 @@ def train_round(
         model.train(device=accelerator.ultralytics_device, **arguments)
 
     finished = time.perf_counter()
+    trainer = getattr(model, "trainer", None)
+    ema = getattr(getattr(trainer, "ema", None), "ema", None)
+    source = ema if ema is not None else model.model
+    weights = {
+        key: value.detach().float().cpu() if hasattr(value, "detach") and value.is_floating_point() else
+        (value.detach().cpu() if hasattr(value, "detach") else value)
+        for key, value in source.state_dict().items()
+    }
     setup_end = marks.get("setup_end", marks["call"])
     epoch_start = marks.get("epoch_start", setup_end)
     epoch_end = marks.get("epoch_end", finished)
@@ -233,4 +299,6 @@ def train_round(
         "epoch_seconds": round(max(0.0, epoch_end - epoch_start), 3),
         "post_seconds": round(max(0.0, finished - epoch_end), 3),
         "batches": state["batches"],
-    }
+        "optimizer_steps": int(getattr(trainer, "gradmesh_steps", 0) or 0),
+        "flushed_gradients": bool(state.get("flushed")),
+    }, weights

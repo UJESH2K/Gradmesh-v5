@@ -607,6 +607,7 @@ class Agent:
         self.diagnostics_at = 0.0
         self.cache: Optional[DatasetCache] = None
         self.dataloader_workers = 0
+        self.batches_done = 0
 
     # -- setup ---------------------------------------------------------------
 
@@ -872,7 +873,7 @@ class Agent:
 
     def run_batch(self, batch: dict) -> None:
         from federated_training import state_dict_from_bytes, state_dict_to_bytes
-        from trainers import train_round
+        from trainers import is_loader_crash, train_round
         from ultralytics import YOLO
 
         round_index = int(batch.get("round_index", 0))
@@ -899,20 +900,25 @@ class Agent:
                 downloaded = time.time()
 
                 self.set_status(phase="loading")
-                model = YOLO(str(model_path))
-                if weights:
-                    state = state_dict_from_bytes(weights)
-                    current = model.model.state_dict()
-                    # Filter incompatible tensors, such as a class head whose
-                    # shape changed, exactly as v3 did.
-                    compatible = {
-                        key: value
-                        for key, value in state.items()
-                        if key in current
-                        and hasattr(value, "shape")
-                        and tuple(value.shape) == tuple(current[key].shape)
-                    }
-                    model.model.load_state_dict(compatible, strict=False)
+
+                def build_model():
+                    built = YOLO(str(model_path))
+                    if weights:
+                        state = state_dict_from_bytes(weights)
+                        current = built.model.state_dict()
+                        # Filter incompatible tensors, such as a class head
+                        # whose shape changed, exactly as v3 did.
+                        compatible = {
+                            key: value
+                            for key, value in state.items()
+                            if key in current
+                            and hasattr(value, "shape")
+                            and tuple(value.shape) == tuple(current[key].shape)
+                        }
+                        built.model.load_state_dict(compatible, strict=False)
+                    return built
+
+                model = build_model()
                 loaded = time.time()
 
                 options: Dict[str, Any] = {
@@ -923,7 +929,11 @@ class Agent:
                     "project": str(workdir / "runs"),
                     "name": "round_%d" % round_index,
                     "exist_ok": True,
-                    "workers": self.dataloader_workers,
+                    "workers": (
+                        int(batch["dataloader_workers"])
+                        if batch.get("dataloader_workers") is not None
+                        else self.dataloader_workers
+                    ),
                 }
                 if batch.get("seed") is not None:
                     options["seed"] = int(batch["seed"])
@@ -940,15 +950,36 @@ class Agent:
                         self.set_status(progress=update)
 
                 self.set_status(phase="training")
-                timings = train_round(
-                    model,
-                    self.accelerator,
-                    options,
-                    validate=bool(batch.get("worker_validation")),
-                    on_progress=progress,
-                )
+                try:
+                    timings, trained = train_round(
+                        model,
+                        self.accelerator,
+                        options,
+                        validate=bool(batch.get("worker_validation")),
+                        on_progress=progress,
+                    )
+                except Exception as exc:
+                    if not (is_loader_crash(exc) and options["workers"] > 0):
+                        raise
+                    # A dataloader process died, typically for lack of memory.
+                    # The round is still perfectly trainable in-process, so
+                    # retry it that way and stay there for this session.
+                    log("dataloader processes failed (%s); retrying with workers=0" % str(exc)[:120])
+                    self.dataloader_workers = 0
+                    options["workers"] = 0
+                    del model
+                    gc.collect()
+                    self.accelerator.empty_cache()
+                    model = build_model()
+                    timings, trained = train_round(
+                        model,
+                        self.accelerator,
+                        options,
+                        validate=bool(batch.get("worker_validation")),
+                        on_progress=progress,
+                    )
                 self.set_status(training_epoch=total_epochs, phase="uploading", progress=None)
-                result = state_dict_to_bytes(model.model.state_dict())
+                result = state_dict_to_bytes(trained)
                 finished = time.time()
 
                 metrics = {
@@ -961,7 +992,8 @@ class Agent:
                     "samples": int(batch.get("samples") or 0),
                     "imgsz": batch.get("imgsz"),
                     "batch_size": batch.get("batch_size"),
-                    "dataloader_workers": self.dataloader_workers,
+                    "dataloader_workers": options["workers"],
+                    "first_batch": self.batches_done == 0,
                     "download_seconds": round(downloaded - assigned, 3),
                     "load_seconds": round(loaded - downloaded, 3),
                     "total_seconds": round(finished - assigned, 3),
@@ -973,6 +1005,7 @@ class Agent:
                     **timings,
                 }
                 self.submit(batch, result, metrics)
+                self.batches_done += 1
                 log(
                     "finished shard %s: epoch %.1fs, setup %.1fs, fetched %s"
                     % (
