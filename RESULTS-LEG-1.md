@@ -466,3 +466,27 @@ fig1..fig6.pdf  generated figures
 Sweep artefacts live under `.gradmesh/`, which is not committed. Keep the
 downloaded copies of these two sweeps somewhere durable before leg 2 overwrites
 the working directory.
+
+---
+
+## Addendum: what GradMesh 5 changed in response
+
+Written after the analysis above, for anyone comparing leg 1 with later legs.
+
+| Leg 1 finding | v5 response |
+|---|---|
+| Fixed cost of ~19 s per round sets the scaling floor | Affine cost model in the scheduler; worker-side validation off, offline AMP check, cached images: under 1 s per round in testing |
+| Identical GPUs trained 2x apart | Host diagnostics on every machine card; the likely cause for COE-2 (it hosted the coordinator) is now flagged as "also runs the coordinator" |
+| Proportional over-corrected at 100 images | Affine sizing with bounded estimate steps; the v4 split is kept as `proportional-linear` for the comparison |
+| Strategy arms ran in blocks | Arms already alternate; unchanged |
+| Accuracy fell after round 1 (warmup) | Warmup in round 1 only, by default |
+| Latency probe read zero | Fixed before v5; unchanged |
+| COCO8 clamped the size axis | Guard already in place; unchanged |
+| Dropped shard reported in a single-worker round | Fixed: lost shards are counted per dataset slice, and speculative clones are reported separately |
+| Cold estimates for two rounds | Estimates persist per machine and workload across trials and restarts |
+
+Two further defects found in v5 testing **void the accuracy axis of leg 1**
+beyond the warmup issue: rounds with fewer than 64 images per worker never
+stepped the optimiser, and every round rounded the model to fp16 before
+averaging. See RESEARCH.md section 12.3. The timing results of leg 1 are
+unaffected.

@@ -358,3 +358,61 @@ names, the scheduler policy in force, and the network label.
 That covers the disclosure a reviewer checks before they check your numbers, with
 one exception worth adding by hand: **GPU driver versions**, which are not
 collected. Record them yourself with `nvidia-smi` on each machine.
+
+---
+
+## Version 5: vendor mixes and the three-arm ablation
+
+### Vendor mixes
+
+**Vendor mixes** in the design turns the sweep into a cross-vendor experiment.
+Choose any of NVIDIA, Intel, Apple, the pairs, or all three. Each trial then
+uses every online machine of that mix rather than a machine count, and a
+single-machine baseline (the strongest machine of any vendor) is added
+automatically, so every speedup has a denominator. A mix with a vendor that is
+not online is recorded as skipped with the reason; it is never run on a
+smaller, differently composed mesh under the same label.
+
+Results carry a `mix` column ("NVIDIA+Intel+Apple"), and every round records a
+`by_backend` breakdown: images, machine seconds, pure training seconds and
+aggregation weight per vendor.
+
+A sensible first cross-vendor design, with one machine of each vendor:
+
+| Parameter | Value |
+|---|---|
+| Vendor mixes | NVIDIA, NVIDIA + Intel, NVIDIA + Apple, All three |
+| Dataset sizes | 1000, 5000 |
+| Arms | Affine (v5), Rate-proportional (v4) |
+| Repeats | 3 (baselines 5) |
+| Rounds | 10 |
+
+### Three partitioning arms
+
+| Arm | Sizing |
+|---|---|
+| Affine (v5) | fixed overhead per round plus a per-image rate; machines whose overhead exceeds the round sit it out |
+| Rate-proportional (v4) | proportional to rate alone |
+| Equal | the same share for everyone |
+
+Leg 1 compared only the last two. The headline v5 comparison is affine against
+rate-proportional, at the small dataset sizes where they differ most.
+
+### Defaults changed in v5
+
+- **Rounds per trial: 10** (was 5), so the estimator's warmup is a 20% tax.
+- **Warmup: round 1 only.** `every-round` reproduces leg 1.
+- **Worker-side validation: off.** The coordinator scores the global model on
+  the fixed held-out split, which is the number every report uses.
+- **Estimates carry across trials.** Learned rates and overheads persist per
+  machine and workload, so later trials start warm. Use **Re-measure** on a
+  machine card to reset one after a hardware or driver change.
+
+### Before a long sweep on new hardware
+
+Run the smallest design (one dataset size, one repeat, two rounds) on each new
+machine type first. The NVIDIA path in v5 was exercised end to end; the Intel
+XPU and Apple MPS paths follow PyTorch's documented APIs and are covered by unit
+tests, but should be smoke-tested on the actual machines before a day of
+compute depends on them. `npm run doctor` on each machine confirms its build,
+its kernel launch, and that it is on the reference stack.

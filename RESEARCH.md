@@ -1,5 +1,8 @@
 # GradMesh: scheduling heterogeneous consumer GPUs for collaborative training
 
+> Version 5 extends this model with an affine round cost and three GPU vendors;
+> see section 12.
+
 This document states the model GradMesh implements, why each policy is there,
 what is claimed, what is not, and how to measure it. It is written to be the
 methodology section of a paper and to be checkable against the code.
@@ -326,3 +329,119 @@ round on hardware nobody controls.
    a marketplace.
 5. **Cross-subnet meshes.** NAT traversal and transport security are out of
    scope for a LAN prototype and are the next real systems problem.
+
+---
+
+## 12. Version 5: an affine cost model across three GPU vendors
+
+GradMesh 5 is the baseline for the cross-vendor study: NVIDIA (CUDA), Intel
+(XPU) and Apple (Metal) devices training one model. Two changes to the model
+above follow from leg 1, and a set of fixes changes how earlier accuracy
+numbers should be read.
+
+### 12.1 The affine round cost
+
+Section 4 models worker time as `s_i / r_i`. Leg 1 measured otherwise. On one
+RTX 5070 a round cost
+
+```
+T(n) = 18.77 s + 0.0418 s/image · n
+```
+
+so at 100 images per round 82% of the round was fixed cost. A rate-only model
+cannot see that, and proportional sizing then over-corrects on noise exactly
+where the fixed cost dominates, which is the reversal leg 1 saw at 100 images.
+
+v5 models each worker as
+
+```
+t_i(s_i) = f_i + s_i / r_i
+```
+
+with `f_i` the per-round overhead (transfer, model load, trainer and data
+loader construction, checkpointing, upload) and `r_i` the per-image rate of the
+training loop alone. Minimising `max_i t_i` subject to `Σ s_i = N`, `s_i ≥ 0`
+gives equal finish times over the participating set `P`:
+
+```
+T = (N + Σ_{i∈P} r_i f_i) / Σ_{i∈P} r_i        s_i = r_i (T − f_i)
+```
+
+A worker with `f_i ≥ T` would need a negative share, so it is excluded and `T`
+re-solved. Taking workers in increasing order of `f_i` and stopping at the
+first that would be excluded yields the optimal `P` (water filling on the
+affine costs). Two properties follow and are asserted in the test suite:
+
+- **Monotonicity.** Adding a worker never increases the planned makespan: it
+  either joins `P` and lowers `T`, or is excluded and leaves `T` unchanged.
+  Checked on 200 random meshes.
+- **Leg 1 cross-validation.** With `f = 18.77 s` and `r = 23.9 img/s` for two
+  identical machines, the model predicts 1.53x at 1000 images and about 1.1x at
+  100, which are the ceilings measured in leg 1, with no parameters fitted to
+  the two-machine data.
+
+Rates and overheads are learned separately from the phase timings the worker
+reports (setup, epoch, post-processing, transfer), by an EWMA whose single-step
+change is bounded (`max_estimate_step`, default 2.5x), per workload (checkpoint
+and image size), and persisted across coordinator restarts. A worker's first
+round after it starts pays one-off CUDA and cuDNN initialisation; that
+observation is marked cold and the first warm observation replaces it rather
+than being averaged with it.
+
+The v4 rule remains selectable as `proportional-linear`, so the ablation is
+three-armed: affine, linear, equal.
+
+### 12.2 Heterogeneity that is not in the hardware
+
+The two RTX 5070s in leg 1 probed within 4% and trained at 29.9 and 14.7
+img/s. v5 reports, per machine and every 30 s, the factors that can produce
+such a gap without any hardware difference: running the coordinator on the
+same machine, battery power, the Windows power plan, GPU throttle reasons,
+other processes on the GPU, PCIe link width, CPU load and free memory. The
+scheduler does not use them directly; it learns the resulting rate either way.
+They exist so a speed difference can be attributed rather than merely observed.
+
+### 12.3 Training-correctness fixes, and what they mean for leg 1
+
+Live testing of v5 found two defects in the training call, present since v3,
+in addition to the warmup issue leg 1 identified.
+
+1. **Small shards never stepped the optimiser.** Ultralytics accumulates
+   gradients to a nominal batch of 64 and steps only then. With batch 8, a
+   shard of fewer than 8 batches (64 images) finished a round with no optimiser
+   step, and every round discarded the gradients accumulated since its last
+   step. In leg 1 every two-machine 100-image trial (about 6 batches per shard)
+   trained nothing outside warmup. v5 flushes pending gradients at the end of
+   each round and reports the number of optimiser steps.
+2. **Weights were rounded to fp16 every round.** Workers returned the
+   checkpoint Ultralytics reloads after training, which it stores in half
+   precision. Updates smaller than fp16 resolution were erased round after
+   round. v5 returns the trainer's fp32 EMA weights.
+
+On a 56-image dataset, four rounds on one RTX 3050 gave mAP50 0.046, 0.055,
+0.057, 0.074 with the fixes, against 0.046 in every round without them. The
+accuracy axis of leg 1 should be treated as void, not merely noisy. Its timing
+results remain valid: neither defect changes how long a round takes.
+
+### 12.4 Cross-vendor aggregation
+
+All workers run the same reference stack (torch 2.13.0, torchvision 0.28.0,
+ultralytics 8.4.46) and the same recipe (optimiser, learning rate, warmup,
+seed). Weights are serialised on CPU in fp32, so a CUDA, an XPU and an MPS
+update are averaged by the same arithmetic. What differs between vendors is
+kernel numerics: AMP runs on CUDA only (Ultralytics disables it for MPS, and the
+XPU path disables it explicitly), and some operators fall back to CPU on Metal.
+These are properties of the platforms rather than of GradMesh, and the
+vendor-mix experiment is what measures whether they matter.
+
+### 12.5 Questions the cross-vendor study can answer
+
+1. **Does the affine planner hold across vendors?** Per-vendor overheads differ
+   (Metal shader compilation, XPU runtime start-up, CUDA context creation);
+   predicted against observed finish times per round answer this directly.
+2. **What does each vendor add?** Speedup of NVIDIA+Intel, NVIDIA+Apple and all
+   three against NVIDIA alone, at each dataset size.
+3. **Is accuracy vendor-neutral?** Final mAP of mixed meshes against
+   single-vendor meshes at equal data, under identical recipes.
+4. **Where is the crossover?** The dataset size at which adding a slower vendor
+   stops helping, which section 12.1 predicts from measured `f_i` and `r_i`.
