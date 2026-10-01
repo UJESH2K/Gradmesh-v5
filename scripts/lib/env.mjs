@@ -198,24 +198,72 @@ export function readCoordinatorState() {
   }
 }
 
+// Adapters that exist on the host but that no other device on the Wi-Fi can
+// reach: hypervisor host-only networks, WSL, Docker, VPN overlays. v4 ranked by
+// address range alone, so VirtualBox's 192.168.56.1 beat the real Wi-Fi address
+// and every printed join command pointed at a network nobody else was on.
+const VIRTUAL_ADAPTER =
+  /vethernet|virtualbox|vbox|vmware|vmnet|hyper-v|wsl|docker|br-|veth|tailscale|zerotier|wireguard|utun|tun\d|tap\d|vpn|npcap|loopback|bluetooth/i;
+
 /** Every routable IPv4 address this host answers on, best guess first. */
 export function lanAddresses() {
   const found = [];
   for (const [name, entries] of Object.entries(networkInterfaces())) {
     for (const entry of entries || []) {
       if (entry.family !== "IPv4" || entry.internal) continue;
-      found.push({ name, address: entry.address });
+      if (entry.address.startsWith("169.254.")) continue; // link-local: no DHCP answer
+      found.push({ name, address: entry.address, virtual: VIRTUAL_ADAPTER.test(name) });
     }
   }
-  // Prefer private ranges, since that is what a peer on the same Wi-Fi will use.
-  const score = (address) =>
+  const range = (address) =>
     address.startsWith("192.168.") ? 0 : address.startsWith("10.") ? 1 : address.startsWith("172.") ? 2 : 3;
-  found.sort((a, b) => score(a.address) - score(b.address));
+  const wireless = (name) => (/wi-?fi|wlan|wireless|en0|eth|ethernet/i.test(name) ? 0 : 1);
+  found.sort(
+    (a, b) =>
+      Number(a.virtual) - Number(b.virtual) ||
+      wireless(a.name) - wireless(b.name) ||
+      range(a.address) - range(b.address)
+  );
   return found;
 }
 
 export function primaryLanAddress() {
   return lanAddresses()[0]?.address || "127.0.0.1";
+}
+
+/**
+ * The address the operating system actually routes LAN traffic from.
+ *
+ * Connecting a UDP socket sends nothing; it only asks the routing table which
+ * interface would be used. That is the address a peer can reach, whatever the
+ * adapters are called.
+ */
+export async function routedLanAddress() {
+  const dgram = await import("node:dgram");
+  return new Promise((resolve) => {
+    const socket = dgram.createSocket("udp4");
+    const finish = (value) => {
+      try {
+        socket.close();
+      } catch {
+        // already closed
+      }
+      resolve(value);
+    };
+    socket.on("error", () => finish(primaryLanAddress()));
+    try {
+      socket.connect(9, "10.255.255.255", () => {
+        try {
+          const { address } = socket.address();
+          finish(address && address !== "0.0.0.0" ? address : primaryLanAddress());
+        } catch {
+          finish(primaryLanAddress());
+        }
+      });
+    } catch {
+      finish(primaryLanAddress());
+    }
+  });
 }
 
 export function run(command, args, options = {}) {

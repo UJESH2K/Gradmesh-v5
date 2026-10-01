@@ -128,15 +128,24 @@ export async function setupControlPlane(options = cliOptions()) {
   }
 }
 
-export async function setupTrainingPlane({ quiet = false, ...rest } = {}) {
+export async function setupTrainingPlane({ quiet = false, host = true, ...rest } = {}) {
   const options = { ...cliOptions(), ...rest };
-  if (!quiet) log("setup", "installing the training plane, PyTorch is a large download the first time");
+  if (!quiet) log("setup", "checking the training plane; PyTorch is a large download the first time");
   const code = await setupEnv(
-    ["install", "--plane", "training", "--host", ...sharedArgs(options), ...(quiet ? ["--quiet"] : [])],
+    [
+      "install",
+      "--plane",
+      "training",
+      // A host falls back to the CPU build when its GPU cannot train, because
+      // it still has to aggregate. A worker has no use for that.
+      ...(host ? ["--host"] : []),
+      ...sharedArgs(options),
+      ...(quiet ? ["--quiet"] : []),
+    ],
     { quiet }
   );
   const state = readSetupState();
-  if (code !== 0 && state.trainingPlane !== "failed") {
+  if (code !== 0 && !["failed", "blocked"].includes(state.trainingPlane)) {
     writeSetupState({ trainingPlane: "failed", trainingError: `setup exited with code ${code}` });
   }
   if (!quiet) {

@@ -15,15 +15,17 @@ import {
   COORDINATOR_PORT,
   ENGINE_DIR,
   IS_WINDOWS,
+  PATHS,
   REPO_ROOT,
+  STATE_DIR,
   WEB_PORT,
   banner,
   lanAddresses,
   log,
   paint,
   portInUse,
-  primaryLanAddress,
   readCoordinatorState,
+  routedLanAddress,
   spawnBackground,
   venvPython,
   waitForHttp,
@@ -114,8 +116,8 @@ async function main() {
   await requirePorts();
 
   banner([
-    paint("bold", "GradMesh 4"),
-    paint("gray", "Every GPU on your network, one training cluster."),
+    paint("bold", "GradMesh 5"),
+    paint("gray", "NVIDIA, Intel and Apple GPUs on one network, one training cluster."),
   ]);
 
   await setupControlPlane();
@@ -136,13 +138,23 @@ async function main() {
         String(COORDINATOR_PORT),
         "--log-level",
         "warning",
+        // Workers keep one connection open per thread and beat every few
+        // seconds. Uvicorn's default 5 s keep-alive closes it just as the next
+        // beat reuses it, which surfaced as a stream of spurious disconnects.
+        "--timeout-keep-alive",
+        "75",
       ],
       {
         cwd: ENGINE_DIR,
         label: "coordinator",
         color: "magenta",
         filter: isInterestingCoordinatorLine,
-        env: { PYTHONUNBUFFERED: "1", GRADMESH_STATE_DIR: path.join(REPO_ROOT, ".gradmesh") },
+        env: {
+          PYTHONUNBUFFERED: "1",
+          GRADMESH_STATE_DIR: STATE_DIR,
+          GRADMESH_WEB_PORT: String(WEB_PORT),
+          GRADMESH_COORDINATOR_PORT: String(COORDINATOR_PORT),
+        },
       }
     ),
     "coordinator"
@@ -162,11 +174,27 @@ async function main() {
 
   // The dashboard does not need torch, so this runs unattended while the UI is
   // already usable. Runs are blocked with a clear message until it finishes.
+  //
+  // It runs on every start, not only when the record says something is
+  // missing: a git pull can change the pinned stack, and a GPU driver update
+  // can change which build this machine needs. When nothing changed it skips
+  // pip and only re-verifies the accelerator, in the background.
   const setupState = readSetupState();
   if (setupState.trainingPlane !== "ready") {
-    log("setup", "installing the training plane in the background", "yellow");
-    setupTrainingPlane({ quiet: true }).catch(() => {});
+    log("setup", `installing the training plane in the background (log: ${PATHS.setupLog})`, "yellow");
   }
+  setupTrainingPlane({ quiet: true })
+    .then(() => {
+      const after = readSetupState();
+      if (after.trainingPlane === "failed") {
+        log("setup", `training plane install failed, details in ${PATHS.setupLog}`, "red");
+      } else if (after.accelerator === "unavailable") {
+        log("setup", `PyTorch installed, but this machine's GPU cannot train: ${after.acceleratorProblem}`, "yellow");
+      } else if (setupState.trainingPlane !== "ready" && after.trainingPlane === "ready") {
+        log("setup", `training plane ready: torch ${after.torch}`, "green");
+      }
+    })
+    .catch(() => {});
 
   log("web", `starting on 0.0.0.0:${WEB_PORT}`);
   track(
@@ -181,6 +209,7 @@ async function main() {
         color: "cyan",
         env: {
           GRADMESH_COORDINATOR_URL: `http://127.0.0.1:${COORDINATOR_PORT}`,
+          GRADMESH_STATE_DIR: STATE_DIR,
           NEXT_TELEMETRY_DISABLED: "1",
         },
         filter: (line) => !/^\s*[-‐]\s*(Local|Network):/.test(line),
@@ -191,7 +220,7 @@ async function main() {
 
   await waitForHttp(`http://127.0.0.1:${WEB_PORT}/api/health`, { timeoutMs: 180000 });
 
-  const lan = primaryLanAddress();
+  const lan = await routedLanAddress();
   const token = readCoordinatorState()?.mesh_token || "";
   const joinUrl = `http://${lan}:${WEB_PORT}/join`;
 
@@ -218,7 +247,7 @@ async function main() {
   console.log("");
   banner(lines);
 
-  const others = lanAddresses().slice(1);
+  const others = lanAddresses().filter((entry) => entry.address !== lan);
   if (others.length) {
     log(
       "gradmesh",
@@ -228,6 +257,13 @@ async function main() {
   }
   if (!token) {
     log("gradmesh", "no mesh token yet, the coordinator will mint one on first use", "yellow");
+  }
+  if (PATHS.synced) {
+    log(
+      "gradmesh",
+      `this checkout is in a synced folder; machine-specific files live in ${PATHS.machineDir}`,
+      "gray"
+    );
   }
   console.log("");
   log("gradmesh", "press Ctrl+C to stop", "gray");

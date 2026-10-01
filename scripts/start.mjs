@@ -19,7 +19,8 @@ import {
   banner,
   log,
   paint,
-  primaryLanAddress,
+  STATE_DIR,
+  routedLanAddress,
   spawnBackground,
   venvPython,
   waitForHttp,
@@ -72,12 +73,22 @@ async function main() {
         String(COORDINATOR_PORT),
         "--log-level",
         "warning",
+        // Workers keep one connection open per thread and beat every few
+        // seconds. Uvicorn's default 5 s keep-alive closes it just as the next
+        // beat reuses it, which surfaced as a stream of spurious disconnects.
+        "--timeout-keep-alive",
+        "75",
       ],
       {
         cwd: ENGINE_DIR,
         label: "coordinator",
         color: "magenta",
-        env: { PYTHONUNBUFFERED: "1", GRADMESH_STATE_DIR: path.join(REPO_ROOT, ".gradmesh") },
+        env: {
+          PYTHONUNBUFFERED: "1",
+          GRADMESH_STATE_DIR: STATE_DIR,
+          GRADMESH_WEB_PORT: String(WEB_PORT),
+          GRADMESH_COORDINATOR_PORT: String(COORDINATOR_PORT),
+        },
       }
     )
   );
@@ -88,9 +99,8 @@ async function main() {
   log("coordinator", "ready", "green");
   const mdns = health?.mdns?.active ? health.mdns.hostname : null;
 
-  if (readSetupState().trainingPlane !== "ready") {
-    setupTrainingPlane({ quiet: true }).catch(() => {});
-  }
+  // Same as dev: install if missing, otherwise only re-verify, in the background.
+  setupTrainingPlane({ quiet: true }).catch(() => {});
 
   children.push(
     spawnBackground(
@@ -104,6 +114,7 @@ async function main() {
         color: "cyan",
         env: {
           GRADMESH_COORDINATOR_URL: `http://127.0.0.1:${COORDINATOR_PORT}`,
+          GRADMESH_STATE_DIR: STATE_DIR,
           NEXT_TELEMETRY_DISABLED: "1",
         },
       }
@@ -111,7 +122,7 @@ async function main() {
   );
 
   await waitForHttp(`http://127.0.0.1:${WEB_PORT}/api/health`, { timeoutMs: 120000 });
-  const lan = primaryLanAddress();
+  const lan = await routedLanAddress();
   banner([
     `${paint("green", "●")} ${paint("bold", "GradMesh is serving")}`,
     ...(mdns ? [`  Other devices  ${paint("cyan", `http://${mdns}:${WEB_PORT}`)}`] : []),

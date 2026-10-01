@@ -369,36 +369,6 @@ def diagnostics(accelerator: Optional[Accelerator] = None, gpu_index: int = 0, s
     return info
 
 
-def health_warnings(diag: dict, co_located: bool = False) -> List[str]:
-    """Plain-language reasons this machine may train slower than its GPU suggests."""
-    warnings: List[str] = []
-    if co_located:
-        warnings.append(
-            "also runs the coordinator, so shard serving, aggregation and evaluation compete with training"
-        )
-    if diag.get("on_battery"):
-        warnings.append("running on battery, which caps CPU and GPU clocks on most laptops")
-    plan = str(diag.get("power_plan") or "").lower()
-    if plan and ("saver" in plan or "balanced" in plan):
-        warnings.append("Windows power plan is %s; High performance avoids clock down-shifts" % diag.get("power_plan"))
-    reasons = diag.get("throttle_reasons") or []
-    if reasons:
-        warnings.append("GPU is throttling: %s" % ", ".join(reasons))
-    others = diag.get("other_gpu_processes") or 0
-    if others:
-        warnings.append("%d other process%s using this GPU" % (others, "" if others == 1 else "es"))
-    width, width_max = diag.get("pcie_width"), diag.get("pcie_width_max")
-    if width and width_max and width < width_max and (diag.get("gpu_utilization") or 0) > 20:
-        warnings.append("PCIe link at x%d of x%d" % (int(width), int(width_max)))
-    load = diag.get("cpu_load")
-    if isinstance(load, (int, float)) and load >= 85:
-        warnings.append("CPU is %d%% busy, and YOLO data loading is CPU-bound" % int(load))
-    available = diag.get("ram_available_mb")
-    if isinstance(available, (int, float)) and available < 1500:
-        warnings.append("only %d MB of system memory free" % int(available))
-    return warnings
-
-
 if __name__ == "__main__":
     from accelerator import detect_accelerator
 

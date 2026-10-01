@@ -733,7 +733,7 @@ class Agent:
         while not self.stop.wait(max(1.0, self.heartbeat_seconds)):
             started = time.perf_counter()
             try:
-                response = self.client.call("POST", "/heartbeat", json=self.heartbeat_payload(), retries=0, timeout=10)
+                response = self.client.call("POST", "/heartbeat", json=self.heartbeat_payload(), retries=1, timeout=10)
             except TransientError:
                 if self.unreachable_since is None:
                     self.unreachable_since = time.time()

@@ -11,6 +11,7 @@ optional images/val and labels/val, and a data.yaml at the shard root.
 
 from __future__ import annotations
 
+import os
 import random
 import shutil
 import zipfile
@@ -231,6 +232,125 @@ def build_proportional_shards(
         )
 
     return shards
+
+
+# ---------------------------------------------------------------------------
+# v5: shards as file lists
+# ---------------------------------------------------------------------------
+#
+# v4 materialised every shard every round: copy each image and label into a
+# shard directory, then zip it with deflate. For a 1000-image round that is two
+# thousand file copies and a compression pass over JPEGs that do not compress,
+# on the coordinator, which in leg 1 was also one of the two workers and the
+# one that trained at half speed. v5 plans a shard as a list of files. Workers
+# keep the images they have seen and fetch only what is new (`bundle`), and the
+# old zip is built on demand only for an agent that asks for it.
+
+
+def plan_shard_lists(
+    dataset_root: Path,
+    sizes: Sequence[int],
+    seed: int = 0,
+    manifest: Optional[Path] = None,
+    splits: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Partition the training images into shards of `sizes`, without copying."""
+    if not sizes:
+        raise ValueError("At least one shard size is required")
+    listing = list_split_images(dataset_root, manifest=manifest, splits=splits)
+    if not listing["train"]:
+        raise ValueError("No training images were found in the dataset")
+    groups = partition(listing["train"], sizes, seed)
+    base = listing["dirs"]["train_images"]
+    return {
+        "dirs": listing["dirs"],
+        "val": listing["val"],
+        "groups": [[path.relative_to(base).as_posix() for path in group] for group in groups],
+    }
+
+
+def label_for(dirs: Dict[str, Any], image_rel: str) -> Optional[Path]:
+    labels = dirs.get("train_labels")
+    if labels is None:
+        return None
+    return Path(labels) / Path(image_rel).with_suffix(".txt")
+
+
+def shard_manifest(dirs: Dict[str, Any], files: Sequence[str]) -> List[Dict[str, Any]]:
+    """What a worker needs to check its cache: path and size of every pair."""
+    base = Path(dirs["train_images"])
+    entries = []
+    for rel in files:
+        image = base / rel
+        label = label_for(dirs, rel)
+        try:
+            size = image.stat().st_size
+        except OSError:
+            continue
+        label_size = label.stat().st_size if label is not None and label.is_file() else None
+        entries.append({"image": rel, "size": size, "label_size": label_size})
+    return entries
+
+
+def _resolve_inside(base: Path, rel: str) -> Path:
+    target = (base / rel).resolve()
+    root = base.resolve()
+    if os.path.commonpath([str(root), str(target)]) != str(root):
+        raise ValueError("path escapes the dataset: %s" % rel)
+    return target
+
+
+def write_bundle(dirs: Dict[str, Any], files: Sequence[str], destination: Path) -> int:
+    """Zip the requested image and label pairs, uncompressed, for a worker's cache.
+
+    Members are named images/train/<rel> and labels/train/<rel>.txt, the layout
+    the worker's cache and Ultralytics both expect. Stored rather than deflated:
+    JPEG and PNG are already compressed, so deflate only spends host CPU.
+    """
+    base = Path(dirs["train_images"])
+    count = 0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_STORED) as archive:
+        for rel in files:
+            image = _resolve_inside(base, rel)
+            if not image.is_file() or image.suffix.lower() not in IMAGE_SUFFIXES:
+                continue
+            archive.write(image, "images/train/%s" % rel)
+            label = label_for(dirs, rel)
+            if label is not None and label.is_file():
+                archive.write(label, "labels/train/%s" % Path(rel).with_suffix(".txt").as_posix())
+            count += 1
+    return count
+
+
+def materialize_shard_zip(
+    dirs: Dict[str, Any],
+    files: Sequence[str],
+    val_images: Sequence[Path],
+    class_names: List[str],
+    workdir: Path,
+    replicate_val: bool = True,
+) -> Path:
+    """The v4 shard archive, built only when an agent asks for one."""
+    shard_root = workdir / "shard"
+    if shard_root.exists():
+        shutil.rmtree(shard_root)
+    shard_root.mkdir(parents=True, exist_ok=True)
+    base = Path(dirs["train_images"])
+    _copy_split_pairs([base / rel for rel in files], base, Path(dirs["train_labels"]), shard_root, "train")
+    val_count = 0
+    if replicate_val and dirs.get("val_images") is not None and dirs.get("val_labels") is not None:
+        val_count = _copy_split_pairs(
+            list(val_images), Path(dirs["val_images"]), Path(dirs["val_labels"]), shard_root, "val"
+        )
+    write_data_yaml(shard_root, class_names, val_relative="images/val" if val_count > 0 else "images/train")
+    archive_path = workdir / "shard.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        for file_path in shard_root.rglob("*"):
+            if file_path.is_file():
+                archive.write(file_path, file_path.relative_to(shard_root))
+    shutil.rmtree(shard_root, ignore_errors=True)
+    return archive_path
 
 
 def infer_class_names(dataset_root: Path) -> List[str]:

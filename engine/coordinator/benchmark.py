@@ -40,7 +40,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from coordinator.scheduler import PARTITION_EQUAL, PARTITION_PROPORTIONAL
+from coordinator.scheduler import PARTITION_EQUAL, PARTITION_LINEAR, PARTITION_PROPORTIONAL
 
 SELECTION_STRONGEST = "strongest"
 SELECTION_RANDOM = "random"
@@ -83,11 +83,20 @@ class SuiteConfig:
     rounds: int = 10
     # Ultralytics defaults warmup_epochs to 3.0. A federated round trains for
     # one epoch, so with the default every round of every trial runs entirely
-    # inside learning-rate warmup and never reaches the stable phase, with the
-    # bias group held at warmup_bias_lr = 0.1 throughout. Rounds after the
-    # first continue from aggregated weights and are not fresh training runs,
-    # so they should not warm up at all. None restores the Ultralytics default.
-    warmup_epochs: Optional[float] = 0.0
+    # inside learning-rate warmup and never reaches the stable phase. Rounds
+    # after the first continue from aggregated weights and are not fresh
+    # training runs, so by default only round 1 warms up. "every-round"
+    # reproduces leg 1's behaviour for comparison.
+    warmup_mode: str = "first-round"
+    warmup_epochs: Optional[float] = 1.0
+    optimizer: str = "auto"
+    worker_validation: bool = False
+    # Hardware combinations to compare, each a list of backends: for example
+    # [["cuda"], ["cuda", "xpu"], ["cuda", "mps"], ["cuda", "xpu", "mps"]].
+    # When set, each trial uses every online machine of that mix rather than a
+    # node count, and a single-machine baseline (the strongest machine of any
+    # vendor) is added automatically so speedups have a denominator.
+    vendor_mixes: List[List[str]] = field(default_factory=list)
     imgsz: int = 640
     batch_size: int = 8
     node_selection: str = SELECTION_STRONGEST
@@ -137,21 +146,82 @@ class TrialSpec:
     effective_sample_count: Optional[int] = None
     # Distinct per repeat so the repeats of a cell actually differ.
     seed: int = 0
+    # The vendor mix this trial draws machines from, or None for any machine.
+    backends: Optional[List[str]] = None
+
+    @property
+    def mix(self) -> str:
+        return mix_label(self.backends)
 
     def label(self) -> str:
-        arm = "" if self.strategy == PARTITION_PROPORTIONAL else " equal-split"
-        return "%d node%s, %d images%s, run %d" % (
-            self.node_count,
-            "" if self.node_count == 1 else "s",
-            self.sample_count,
-            arm,
-            self.repeat + 1,
+        arm = {
+            PARTITION_PROPORTIONAL: "",
+            PARTITION_LINEAR: " linear-split",
+            PARTITION_EQUAL: " equal-split",
+        }.get(self.strategy, " " + self.strategy)
+        who = (
+            "%s mesh" % self.mix
+            if self.backends
+            else "%d node%s" % (self.node_count, "" if self.node_count == 1 else "s")
         )
+        return "%s, %d images%s, run %d" % (who, self.sample_count, arm, self.repeat + 1)
 
     def as_dict(self) -> dict:
         payload = asdict(self)
         payload["label"] = self.label()
+        payload["mix"] = self.mix
         return payload
+
+
+VENDOR_NAMES = {"cuda": "NVIDIA", "xpu": "Intel", "mps": "Apple", "cpu": "CPU"}
+
+
+def mix_label(backends: Optional[Sequence[str]]) -> str:
+    """'NVIDIA+Intel+Apple' for ['cuda', 'xpu', 'mps']; 'any' for no restriction."""
+    if not backends:
+        return "any"
+    order = ["cuda", "xpu", "mps", "cpu"]
+    known = sorted(set(backends), key=lambda b: order.index(b) if b in order else 9)
+    return "+".join(VENDOR_NAMES.get(backend, backend) for backend in known)
+
+
+def _expand_mixes(config: SuiteConfig, strategies: List[str]) -> List[TrialSpec]:
+    """Trials over vendor mixes, plus the single-machine baseline."""
+    sizes = sorted(set(size for size in config.dataset_sizes if size > 0))
+    repeats = max(1, config.repeats)
+    baseline_repeats = max(repeats, config.baseline_repeats)
+    mixes: List[Optional[List[str]]] = [None]  # None is the one-machine baseline
+    seen = set()
+    for mix in config.vendor_mixes:
+        cleaned = sorted({backend for backend in mix if backend in VENDOR_NAMES})
+        if cleaned and tuple(cleaned) not in seen:
+            seen.add(tuple(cleaned))
+            mixes.append(cleaned)
+
+    trials: List[TrialSpec] = []
+    index = 0
+    for mix, sample_count, repeat, strategy in itertools.product(
+        mixes, sizes, range(baseline_repeats), strategies
+    ):
+        baseline = mix is None
+        if baseline and strategy != strategies[0]:
+            continue
+        if repeat >= (baseline_repeats if baseline else repeats):
+            continue
+        trials.append(
+            TrialSpec(
+                trial_id=uuid.uuid4().hex[:10],
+                index=index,
+                node_count=1 if baseline else 0,  # resolved when the trial starts
+                sample_count=sample_count,
+                strategy=strategy,
+                repeat=repeat,
+                seed=1000 + repeat * 17,
+                backends=None if baseline else list(mix),
+            )
+        )
+        index += 1
+    return trials
 
 
 def expand(config: SuiteConfig, available_nodes: int) -> List[TrialSpec]:
@@ -172,12 +242,15 @@ def expand(config: SuiteConfig, available_nodes: int) -> List[TrialSpec]:
     uninterpretable. Alternating costs nothing and spreads any drift across
     both arms instead of into the contrast between them.
     """
+    strategies = [s for s in config.strategies if s in {PARTITION_PROPORTIONAL, PARTITION_LINEAR, PARTITION_EQUAL}]
+    if not strategies:
+        strategies = [PARTITION_PROPORTIONAL]
+    if config.vendor_mixes:
+        return _expand_mixes(config, strategies)
+
     counts = [n for n in (config.node_counts or range(1, available_nodes + 1)) if 1 <= n <= available_nodes]
     counts = sorted(set(counts))
     sizes = sorted(set(size for size in config.dataset_sizes if size > 0))
-    strategies = [s for s in config.strategies if s in {PARTITION_PROPORTIONAL, PARTITION_EQUAL}]
-    if not strategies:
-        strategies = [PARTITION_PROPORTIONAL]
 
     repeats = max(1, config.repeats)
     baseline_repeats = max(repeats, config.baseline_repeats)
@@ -187,9 +260,9 @@ def expand(config: SuiteConfig, available_nodes: int) -> List[TrialSpec]:
     for node_count, sample_count, repeat, strategy in itertools.product(
         counts, sizes, range(max(repeats, baseline_repeats)), strategies
     ):
-        # Equal and proportional partitioning are identical on one machine, so
-        # running both would waste a slot and put a duplicate in the ablation.
-        if node_count == 1 and strategy == PARTITION_EQUAL:
+        # Every partitioning strategy is identical on one machine, so running
+        # more than one would waste slots and duplicate the baseline.
+        if node_count == 1 and strategy != strategies[0]:
             continue
         # Only the baseline cells get the extra repeats.
         limit = baseline_repeats if node_count == 1 else repeats
@@ -242,7 +315,8 @@ def estimate_seconds(trials: Sequence[TrialSpec], config: SuiteConfig, throughpu
         throughput_sps = 8.0
     total = 0.0
     for trial in trials:
-        per_round = trial.sample_count / max(1.0, throughput_sps * trial.node_count)
+        # A vendor-mix trial's size is only known when it starts; assume two.
+        per_round = trial.sample_count / max(1.0, throughput_sps * (trial.node_count or 2))
         # Per-round overhead: shard build, transfer, aggregation, evaluation.
         overhead = 6.0 + (12.0 if config.evaluate else 0.0)
         total += config.rounds * (per_round + overhead) + config.settle_seconds
@@ -275,6 +349,9 @@ def trial_result(spec: TrialSpec, run: dict, status: str, error: Optional[str] =
         "run_id": run.get("id"),
         "node_count": spec.node_count,
         "node_ids": spec.node_ids,
+        "mix": spec.mix,
+        "backends": spec.backends,
+        "backend_totals": run.get("backend_totals"),
         "sample_count": spec.sample_count,
         "effective_sample_count": spec.effective_sample_count,
         "strategy": spec.strategy,
@@ -470,12 +547,13 @@ def aggregate_cells(results: Sequence[dict]) -> List[dict]:
     for result in annotate_baselines(results):
         if result.get("status") != STATUS_DONE:
             continue
-        key = (result["node_count"], result["sample_count"], result["strategy"])
+        key = (result.get("mix") or "any", result["node_count"], result["sample_count"], result["strategy"])
         cells.setdefault(key, []).append(result)
 
     rows: List[dict] = []
-    for (node_count, sample_count, strategy), group in sorted(cells.items()):
+    for (mix, node_count, sample_count, strategy), group in sorted(cells.items()):
         row: Dict[str, Any] = {
+            "mix": mix,
             "node_count": node_count,
             "sample_count": sample_count,
             "strategy": strategy,
@@ -539,6 +617,7 @@ CSV_COLUMNS = [
     "trial_id",
     "index",
     "status",
+    "mix",
     "node_count",
     "sample_count",
     "strategy",

@@ -30,11 +30,18 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from federated_training import decode_state_dict
+from federated_training import decode_state_dict, state_dict_from_bytes
 
 
 def torch_device() -> str:
-    """Best device available to the coordinator for evaluation."""
+    """Best device available to the coordinator for evaluation.
+
+    GRADMESH_EVAL_DEVICE pins it, which a paper run should do: accuracy is
+    meant to depend on the weights, not on which kind of GPU the host has.
+    """
+    pinned = os.getenv("GRADMESH_EVAL_DEVICE")
+    if pinned:
+        return pinned
     try:
         import torch
     except Exception:
@@ -44,6 +51,9 @@ def torch_device() -> str:
             return "cuda"
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             return "xpu"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
     except Exception:
         pass
     return "cpu"
@@ -105,7 +115,11 @@ def evaluate_weights(
         from ultralytics import YOLO
 
         model = YOLO(str(base_model_path))
-        state = decode_state_dict(weights_b64)
+        state = (
+            state_dict_from_bytes(bytes(weights_b64))
+            if isinstance(weights_b64, (bytes, bytearray))
+            else decode_state_dict(weights_b64)
+        )
         current = model.model.state_dict()
         compatible = {
             key: value
@@ -199,6 +213,9 @@ def host_snapshot() -> Dict[str, Any]:
         if torch.cuda.is_available():
             info["cuda"] = torch.version.cuda
             info["gpu"] = torch.cuda.get_device_name(0)
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            info["gpu"] = torch.xpu.get_device_name(0)
+        info["eval_device"] = torch_device()
     except Exception:
         info["torch"] = None
     try:

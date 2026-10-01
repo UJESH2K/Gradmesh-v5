@@ -1,23 +1,36 @@
-"""GradMesh v4 coordinator.
+"""GradMesh 5 coordinator.
 
 One FastAPI process owns the whole control plane: node registry, admission,
-round planning, shard materialisation, the round barrier, aggregation, run
-history and the live event stream.
+round planning, shard planning, the round barrier, aggregation, run history and
+the live event stream.
 
-What changed from v3, and why:
+What v4 established, and v5 keeps:
 
-* Shards are sized per node from measured throughput instead of split evenly, so
-  a slow laptop no longer sets the pace for the whole mesh.
-* A background supervisor enforces per-shard deadlines, so a machine that goes
-  to sleep mid-round costs the run seconds rather than the lease timeout.
+* Shards are sized per node from measured performance instead of split evenly.
+* A background supervisor enforces per-shard deadlines and speculates on
+  stragglers.
 * Aggregation is sample-weighted, which is what unequal shards require.
-* Datasets are uploaded through the dashboard and stored in a registry, so the
-  strawberry ZIP is one dataset among many rather than a hard-coded path.
+* Datasets are uploaded through the dashboard and stored in a registry.
 * Every transition is published to an event bus that the dashboard streams.
 
-The training pipeline itself is unchanged. Workers still receive a shard zip, a
-base checkpoint and a global state dict, and still run the same Ultralytics call
-that v3 validated, including the Intel XPU path.
+What v5 changes:
+
+* **Three GPU families in one mesh.** Workers report a backend (cuda, xpu, mps)
+  and vendor; runs can be restricted to a vendor mix, and every round records a
+  per-backend breakdown so cross-vendor results can be reported directly.
+* **An affine cost model.** Each machine's fixed per-round overhead and its
+  per-image rate are learned separately, per workload, and persisted across
+  coordinator restarts (see scheduler.affine_split).
+* **Shards are file lists.** Workers cache images and fetch only what they lack,
+  so the host no longer copies and zips the dataset every round.
+* **Weights move as raw bytes.** The v4 base64 JSON endpoints remain for older
+  agents.
+* **Connections are forgiving.** A busy worker gets a longer liveness window
+  than an idle one, a restarted worker supersedes its old process cleanly, and
+  machine statistics survive a restart.
+* **The training recipe is a run setting.** Warmup policy, optimiser and
+  worker-side validation are chosen per run and applied identically on every
+  backend, which fixes the leg 1 accuracy defect by default.
 """
 
 from __future__ import annotations
@@ -44,9 +57,11 @@ if str(ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(ENGINE_DIR))
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from coordinator import (
     aggregation,
@@ -58,6 +73,8 @@ from coordinator import (
     store,
 )
 from coordinator.events import bus
+from coordinator.health import health_warnings
+from version import PROTOCOL, REFERENCE_STACK, __version__
 
 from coordinator.scheduler import (
     DEFAULT_POLICY,
@@ -70,12 +87,15 @@ from coordinator.scheduler import (
     fitness,
     mesh_reference,
     PARTITION_EQUAL,
+    PARTITION_LINEAR,
     PARTITION_PROPORTIONAL,
+    PARTITION_STRATEGIES,
     imbalance,
     plan_round,
     safe_batch_size,
     should_abort_round,
     straggler_action,
+    update_fixed,
     update_reliability,
     update_throughput,
 )
@@ -84,7 +104,19 @@ from coordinator.scheduler import (
 # so every publish goes through the thread-safe path.
 emit = bus.publish_threadsafe
 
+# What this coordinator offers a worker. A v5 worker uses each one only when the
+# coordinator lists it, so either side can be older than the other.
+FEATURES = ["binary-weights", "image-cache", "phase-timing", "diagnostics", "instance-id"]
+BACKENDS = ("cuda", "xpu", "mps", "cpu")
+VENDOR_OF = {"cuda": "nvidia", "xpu": "intel", "mps": "apple", "cpu": "cpu"}
+WARMUP_MODES = ("first-round", "none", "every-round")
+
 HEARTBEAT_TIMEOUT_SECONDS = float(os.getenv("GRADMESH_HEARTBEAT_TIMEOUT", "20"))
+# A machine in the middle of a shard is given this many timeouts of silence
+# before its work is declared lost. Training saturates a laptop, a Wi-Fi link
+# drops for a few seconds, and dropping a nearly finished shard over that costs
+# far more than waiting a little longer.
+BUSY_TIMEOUT_MULTIPLE = 3.0
 SUPERVISOR_INTERVAL_SECONDS = 2.0
 # Multiples of the heartbeat timeout after which a silent node is dropped from
 # the registry entirely rather than shown as an offline member forever.
@@ -169,30 +201,102 @@ def current_policy() -> MeshPolicy:
     return MeshPolicy.from_dict(store.policy())
 
 
-def _node_view(node: dict, mesh: dict, policy: MeshPolicy) -> dict:
-    view = {key: value for key, value in node.items() if key != "secret"}
-    view["fitness"] = round(fitness(node, mesh, policy), 4)
+# ---------------------------------------------------------------------------
+# Workloads
+# ---------------------------------------------------------------------------
+#
+# A machine's speed is a property of the machine *and* the job: the same GPU
+# trains yolov8n at 320 px several times faster than at 640 px. v4 kept one
+# throughput number per machine, so a run at a new image size started from a
+# number measured on a different workload. v5 keys the learned cost model by
+# checkpoint and image size.
+
+
+def workload_key(base_model: str, imgsz: int) -> str:
+    return "%s@%d" % (Path(base_model or "yolov8n.pt").name, int(imgsz or 640))
+
+
+def _with_workload(node: dict, key: Optional[str]) -> dict:
+    """A copy of `node` whose rate and overhead describe workload `key`."""
+    view = dict(node)
+    workloads = node.get("workloads") or {}
+    entry = workloads.get(key) if key else None
+    if entry is None and key and workloads:
+        # Same checkpoint at another image size: activation cost scales with
+        # pixel count, so scale the rate by the area ratio. Better than
+        # falling back to the probe, which knows nothing about this machine's
+        # data loading.
+        model, _, size = key.rpartition("@")
+        nearest = None
+        for other_key, other in workloads.items():
+            other_model, _, other_size = other_key.rpartition("@")
+            if other_model == model and other.get("rate"):
+                if nearest is None or abs(int(other_size) - int(size)) < abs(int(nearest[0]) - int(size)):
+                    nearest = (other_size, other)
+        if nearest is not None:
+            scale = (int(nearest[0]) / max(1, int(size))) ** 2
+            entry = {"rate": float(nearest[1]["rate"]) * scale, "fixed": nearest[1].get("fixed")}
+    view["throughput_sps"] = float((entry or {}).get("rate") or 0.0)
+    view["fixed_seconds"] = float((entry or {}).get("fixed") or 0.0)
     return view
 
 
-def snapshot_nodes() -> List[dict]:
+def _preview_workload() -> str:
+    """The workload the dashboard's plan preview should describe."""
+    with state_lock:
+        live = sorted(runs.values(), key=lambda run: run.get("created_at") or 0, reverse=True)
+    if live:
+        return workload_key(live[0]["base_model"], live[0]["imgsz"])
+    archived = store.list_runs(limit=1)
+    if archived:
+        return workload_key(archived[0].get("base_model", "yolov8n.pt"), archived[0].get("imgsz", 640))
+    return workload_key("yolov8n.pt", 640)
+
+
+def _node_view(node: dict, mesh: dict, policy: MeshPolicy, key: Optional[str] = None) -> dict:
+    view = {k: v for k, v in _with_workload(node, key).items() if k != "secret"}
+    view["fitness"] = round(fitness(node, mesh, policy), 4)
+    view["vendor"] = node.get("vendor") or VENDOR_OF.get(node.get("backend") or "", "cpu")
+    view["warnings"] = health_warnings(node.get("diagnostics"), bool(node.get("co_located")))
+    view["workload"] = key
+    return view
+
+
+def snapshot_nodes(key: Optional[str] = None) -> List[dict]:
     policy = current_policy()
     now = time.time()
+    key = key or _preview_workload()
     with state_lock:
         _refresh_liveness(now)
         pool = list(nodes.values())
         mesh = mesh_reference(pool, now)
-        return [_node_view(node, mesh, policy) for node in pool]
+        return [_node_view(node, mesh, policy, key) for node in pool]
 
 
 def _refresh_liveness(now: float) -> None:
     for node in nodes.values():
         was_active = node.get("active", False)
-        node["active"] = (now - float(node.get("last_seen") or 0)) <= HEARTBEAT_TIMEOUT_SECONDS
+        silent = now - float(node.get("last_seen") or 0)
+        busy = int(node.get("active_batches") or 0) > 0
+        limit = HEARTBEAT_TIMEOUT_SECONDS * (BUSY_TIMEOUT_MULTIPLE if busy else 1.0)
+        node["active"] = silent <= limit
+        node["liveness"] = (
+            "online" if silent <= HEARTBEAT_TIMEOUT_SECONDS else "suspect" if node["active"] else "offline"
+        )
         if was_active and not node["active"]:
             emit(
                 "node.offline", {"node_id": node["node_id"], "name": node.get("display_name")}
             )
+
+
+def _persist_nodes(node_ids: Sequence[str]) -> None:
+    """Write what the mesh has learned about these machines. Called once per round."""
+    with state_lock:
+        records = {node_id: dict(nodes[node_id]) for node_id in node_ids if node_id in nodes}
+    try:
+        store.put_node_stats(records)
+    except Exception as exc:  # never fail a round over bookkeeping
+        print("[gradmesh] could not persist machine statistics: %s" % exc, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -262,22 +366,34 @@ class RegisterRequest(BaseModel):
     display_name: Optional[str] = None
     gpu: str = "unknown"
     gpu_memory_mb: int = Field(default=8000, ge=1)
-    max_batch_size: int = Field(default=4, ge=1, le=128)
+    max_batch_size: int = Field(default=4, ge=1, le=256)
     backend: str = "cpu"
     supports_training: bool = True
     capability: Optional[dict] = None
     owner: Optional[str] = None
     agent_version: str = "4.0.0"
+    # v5 workers. All optional, so a v4 agent still registers.
+    instance_id: Optional[str] = None
+    protocol: int = 4
+    features: List[str] = Field(default_factory=list)
+    vendor: Optional[str] = None
+    diagnostics: Optional[dict] = None
+    co_located: Optional[bool] = None
+    dataloader_workers: Optional[int] = None
 
 
 class HeartbeatRequest(BaseModel):
     node_id: str
+    instance_id: Optional[str] = None
     load: Optional[float] = None
     active_batches: Optional[int] = None
     allocated_memory_mb: Optional[int] = None
     training_epoch: Optional[int] = None
     training_total_epochs: Optional[int] = None
     latency_ms: Optional[float] = None
+    phase: Optional[str] = None
+    progress: Optional[dict] = None
+    diagnostics: Optional[dict] = None
 
 
 class RoundResultRequest(BaseModel):
@@ -318,12 +434,35 @@ class CreateRunRequest(BaseModel):
     # accuracy and the standard deviation a reviewer asked for is always zero.
     # Timing still varies; accuracy does not.
     seed: int = 0
-    # Learning-rate warmup, in epochs, handed to Ultralytics. A round trains
-    # for one epoch and continues from the aggregated weights, so it is not a
-    # fresh training run and should not warm up. The Ultralytics default of 3.0
-    # means a one-epoch round never leaves warmup at all. None keeps whatever
-    # Ultralytics does by default, which is what earlier runs got.
-    warmup_epochs: Optional[float] = Field(default=0.0, ge=0.0, le=10.0)
+    # Learning-rate warmup. This is the leg 1 accuracy defect: Ultralytics
+    # warms up for 3 epochs by default, a federated round is one epoch, and
+    # the optimiser is rebuilt every round, so with the default every round of
+    # every run sat inside warmup and mAP fell after round 1.
+    #
+    #   first-round  warm up for `warmup_epochs` in round 1 only (default)
+    #   none         never warm up
+    #   every-round  the Ultralytics default every round, i.e. v4 behaviour,
+    #                kept so the defect can be reproduced and measured
+    warmup_mode: str = Field(default="first-round")
+    warmup_epochs: Optional[float] = Field(default=1.0, ge=0.0, le=10.0)
+    # The optimiser, identical on every backend. "auto" is Ultralytics' choice,
+    # which for round-sized jobs is AdamW with a learning rate fitted to the
+    # class count. v4 forced Adam on Intel XPU only, so a mixed-vendor run was
+    # quietly comparing two optimisers.
+    optimizer: str = Field(default="auto")
+    lr0: Optional[float] = Field(default=None, gt=0.0, le=1.0)
+    deterministic: bool = True
+    # Validate on every worker after every round. The coordinator scores the
+    # aggregated model on a fixed split regardless, so this is off by default:
+    # it is two validation passes per worker per round, which nobody reads.
+    worker_validation: bool = False
+    # Dataloader processes per worker. None lets each machine choose from its
+    # own CPU count and backend.
+    dataloader_workers: Optional[int] = Field(default=None, ge=0, le=16)
+    # Only machines with these backends take part: any of cuda, xpu, mps.
+    # This is how a cross-vendor experiment selects NVIDIA-only, Intel plus
+    # Apple, all three, and so on, without unplugging anything.
+    backends: Optional[List[str]] = None
 
 
 class PolicyRequest(BaseModel):
@@ -350,7 +489,7 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, advertiser.start)
 
-    emit("coordinator.ready", {"version": "4.0.0", "mdns": advertiser.as_dict()})
+    emit("coordinator.ready", {"version": __version__, "mdns": advertiser.as_dict()})
     try:
         yield
     finally:
@@ -365,7 +504,7 @@ async def lifespan(app: FastAPI):
         sweeper.shutdown(wait=False)
 
 
-app = FastAPI(title="GradMesh Coordinator", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="GradMesh Coordinator", version=__version__, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -381,24 +520,61 @@ app.add_middleware(
 
 
 @app.post("/register_node")
-def register_node(req: RegisterRequest, _: str = Depends(require_mesh_token)):
+def register_node(req: RegisterRequest, request: Request, _: str = Depends(require_mesh_token)):
     now = time.time()
+    client_host = request.client.host if request.client else None
+    co_located = bool(req.co_located) or client_host in {"127.0.0.1", "::1"} or (
+        client_host is not None and client_host == discovery.local_ipv4()
+    )
+    backend = req.backend if req.backend in BACKENDS else "cpu"
+    superseded = None
+
     with state_lock:
-        existing = nodes.get(req.node_id) or {}
+        existing = nodes.get(req.node_id)
+        if existing is None:
+            # The coordinator restarted, or this machine has been here before:
+            # pick up what the mesh learned about it rather than starting cold.
+            existing = store.node_stats(req.node_id) or {}
+        elif (
+            req.instance_id
+            and existing.get("instance_id")
+            and existing.get("instance_id") != req.instance_id
+        ):
+            # A new process for the same GPU. It wins: the old one has usually
+            # crashed or been restarted, and if it is still alive it is told so
+            # on its next heartbeat and exits. Any shard it held is lost, so
+            # the round replans rather than waiting out a deadline.
+            superseded = existing.get("instance_id")
+            for batch in batches.values():
+                if batch.get("node_id") == req.node_id and batch["status"] in {"queued", "assigned"}:
+                    batch["status"] = "dropped"
+                    batch["error"] = "the worker restarted mid-round"
+
         nodes[req.node_id] = {
             "node_id": req.node_id,
+            "instance_id": req.instance_id,
+            "protocol": req.protocol,
+            "features": list(req.features or []),
             "display_name": req.display_name or req.gpu,
             "gpu": req.gpu,
-            "backend": req.backend,
+            "backend": backend,
+            "vendor": req.vendor or VENDOR_OF.get(backend, "cpu"),
             "gpu_memory_mb": req.gpu_memory_mb,
             "max_batch_size": req.max_batch_size,
+            # Lowered after an out-of-memory failure, and kept across restarts.
+            "batch_cap": existing.get("batch_cap"),
             "supports_training": req.supports_training,
             "capability": req.capability or existing.get("capability") or {},
+            "diagnostics": req.diagnostics or existing.get("diagnostics") or {},
+            "co_located": co_located,
+            "dataloader_workers": req.dataloader_workers,
             "owner": req.owner,
             "agent_version": req.agent_version,
+            "address": client_host,
             "joined_at": existing.get("joined_at", now),
             "last_seen": now,
             "active": True,
+            "liveness": "online",
             "load": 0.0,
             # None, not 0.0. A node that has not been timed yet is not a
             # node on a zero-latency link, and the scheduler's latency term
@@ -406,6 +582,8 @@ def register_node(req: RegisterRequest, _: str = Depends(require_mesh_token)):
             "latency_ms": existing.get("latency_ms"),
             "allocated_memory_mb": 0,
             "active_batches": 0,
+            "phase": "idle",
+            "progress": None,
             "completed_rounds": existing.get("completed_rounds", 0),
             "failed_rounds": existing.get("failed_rounds", 0),
             "samples_trained": existing.get("samples_trained", 0),
@@ -416,7 +594,9 @@ def register_node(req: RegisterRequest, _: str = Depends(require_mesh_token)):
             # Reset on registration: a reconnecting worker has usually been
             # fixed, so quarantine should not outlive the process that earned it.
             "consecutive_failures": 0,
-            "throughput_sps": existing.get("throughput_sps", 0.0),
+            "workloads": existing.get("workloads") or {},
+            "throughput_sps": 0.0,
+            "fixed_seconds": 0.0,
             "training_epoch": 0,
             "training_total_epochs": 0,
         }
@@ -432,15 +612,31 @@ def register_node(req: RegisterRequest, _: str = Depends(require_mesh_token)):
             "node_id": req.node_id,
             "name": req.display_name,
             "gpu": req.gpu,
-            "backend": req.backend,
+            "backend": backend,
+            "vendor": VENDOR_OF.get(backend, "cpu"),
             "tier": decision.tier,
             "reason": decision.reason,
             "gflops": (req.capability or {}).get("gflops"),
+            "restarted": bool(superseded),
         },
     )
+    if req.protocol > PROTOCOL:
+        emit(
+            "node.version",
+            {
+                "node_id": req.node_id,
+                "name": req.display_name,
+                "detail": "this worker is newer than the host (protocol %d against %d); update the host"
+                % (req.protocol, PROTOCOL),
+            },
+        )
     return {
         "status": "registered",
         "node_id": req.node_id,
+        "mesh_id": store.mesh_id(),
+        "version": __version__,
+        "protocol": PROTOCOL,
+        "features": FEATURES,
         "admission": decision.as_dict(),
         "heartbeat_seconds": max(3.0, HEARTBEAT_TIMEOUT_SECONDS / 4),
     }
@@ -452,8 +648,14 @@ def heartbeat(req: HeartbeatRequest, _: str = Depends(require_mesh_token)):
         node = nodes.get(req.node_id)
         if node is None:
             raise HTTPException(status_code=404, detail="Unknown node. Register first.")
+        if req.instance_id and node.get("instance_id") and node["instance_id"] != req.instance_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Superseded: a newer GradMesh worker for this GPU registered, so this one is leaving.",
+            )
         node["last_seen"] = time.time()
         node["active"] = True
+        node["liveness"] = "online"
         if req.load is not None:
             node["load"] = req.load
         if req.active_batches is not None:
@@ -466,30 +668,67 @@ def heartbeat(req: HeartbeatRequest, _: str = Depends(require_mesh_token)):
             node["training_total_epochs"] = req.training_total_epochs
         if req.latency_ms is not None:
             node["latency_ms"] = req.latency_ms
+        if req.phase is not None:
+            node["phase"] = req.phase
+        node["progress"] = req.progress
+        if req.diagnostics:
+            node["diagnostics"] = req.diagnostics
     return {"status": "ok"}
 
 
 @app.post("/leave")
 def leave(req: HeartbeatRequest, _: str = Depends(require_mesh_token)):
     with state_lock:
+        node = nodes.get(req.node_id)
+        # A superseded process saying goodbye must not unregister its successor.
+        if node is not None and req.instance_id and node.get("instance_id") not in (None, req.instance_id):
+            return {"status": "ignored"}
         node = nodes.pop(req.node_id, None)
+        if node is not None:
+            for batch in batches.values():
+                if batch.get("node_id") == req.node_id and batch["status"] in {"queued", "assigned"}:
+                    batch["status"] = "dropped"
+                    batch["error"] = "the worker left the mesh"
     if node:
+        store.put_node_stats({req.node_id: node})
         emit("node.left", {"node_id": req.node_id, "name": node.get("display_name")})
     return {"status": "ok"}
 
 
 @app.delete("/nodes/{node_id}")
-def evict_node(node_id: str, _: str = Depends(require_mesh_token)):
+def evict_node(node_id: str, forget: bool = Query(default=False), _: str = Depends(require_mesh_token)):
     with state_lock:
         node = nodes.pop(node_id, None)
         for batch in batches.values():
             if batch.get("node_id") == node_id and batch["status"] in {"queued", "assigned"}:
                 batch["status"] = "dropped"
                 batch["error"] = "node was evicted by the mesh owner"
-    if node is None:
+    if forget:
+        store.forget_node(node_id)
+    if node is None and not forget:
         raise HTTPException(status_code=404, detail="Unknown node")
-    emit("node.evicted", {"node_id": node_id, "name": node.get("display_name")})
+    emit("node.evicted", {"node_id": node_id, "name": (node or {}).get("display_name")})
     return {"status": "evicted"}
+
+
+@app.post("/nodes/{node_id}/reset")
+def reset_node_estimates(node_id: str, _: str = Depends(require_mesh_token)):
+    """Forget what the mesh learned about a machine's speed and overhead.
+
+    For after a hardware change, a driver update or moving the coordinator off
+    a machine: its old measurements no longer describe it.
+    """
+    with state_lock:
+        node = nodes.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="Unknown node")
+        node["workloads"] = {}
+        node["batch_cap"] = None
+        node["reliability"] = 0.7
+        node["consecutive_failures"] = 0
+    _persist_nodes([node_id])
+    emit("node.reset", {"node_id": node_id, "name": node.get("display_name")})
+    return {"status": "reset"}
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +755,8 @@ def get_batch(node_id: str, _: str = Depends(require_mesh_token)):
             batch["assigned_at"] = time.time()
             node["active_batches"] = 1
             node["allocated_memory_mb"] = batch["memory_mb"]
+            payload = _batch_payload(batch, run, node)
+            batch["resolved_batch_size"] = payload["batch_size"]
 
             emit(
                 "shard.assigned",
@@ -524,41 +765,69 @@ def get_batch(node_id: str, _: str = Depends(require_mesh_token)):
                     "batch_id": batch["batch_id"],
                     "node_id": node_id,
                     "name": node.get("display_name"),
+                    "backend": node.get("backend"),
                     "round": batch["round_index"],
                     "samples": batch["samples"],
                     "predicted_seconds": batch["predicted_seconds"],
                 },
             )
-            return {"batch": _batch_payload(batch, run)}
+            return {"batch": payload}
 
     return {"batch": None}
 
 
-def _batch_payload(batch: dict, run: dict) -> dict:
-    """The wire shape the v3 worker already understands, plus v4 fields."""
+def _warmup_for_round(run: dict, round_index: int) -> Optional[float]:
+    """The warmup_epochs value one round trains with, or None for Ultralytics' default."""
+    mode = run.get("warmup_mode") or "first-round"
+    if mode == "every-round":
+        return None
+    if mode == "none":
+        return 0.0
+    return float(run.get("warmup_epochs") or 0.0) if round_index == 0 else 0.0
+
+
+def _node_batch_ceiling(node: Optional[dict], fallback: Optional[int]) -> Optional[int]:
+    if node is None:
+        return fallback
+    ceilings = [value for value in (node.get("max_batch_size"), node.get("batch_cap")) if value]
+    return min(ceilings) if ceilings else fallback
+
+
+def _batch_payload(batch: dict, run: dict, node: Optional[dict] = None) -> dict:
+    """The wire shape every worker since v3 understands, plus v5 fields."""
     # Batch size is decided per device, not per run. The requested value is a
-    # ceiling; a smaller card gets whatever it can actually hold.
+    # ceiling; a smaller card gets whatever it can actually hold, and a card
+    # that ran out of memory once is capped below that.
     resolved_batch = safe_batch_size(
         device_memory_mb=batch.get("device_memory_mb") or 0,
         imgsz=run["imgsz"],
         requested=run["batch_size"],
-        node_max=batch.get("max_batch_size"),
+        node_max=_node_batch_ceiling(node, batch.get("max_batch_size")),
+        unified_memory=bool(batch.get("unified_memory")),
     )
-    return {
+    warmup = _warmup_for_round(run, batch["round_index"])
+    payload = {
         "batch_id": batch["batch_id"],
         "job_id": run["id"],
         "kind": "training",
         "round_index": batch["round_index"],
         "shard_index": batch["shard_index"],
         "shard_url": "/runs/%s/shards/%d.zip" % (run["id"], batch["shard_index"]),
+        "manifest_url": "/runs/%s/shards/%d/manifest" % (run["id"], batch["shard_index"]),
         "weights_url": "/runs/%s/weights" % run["id"],
+        "weights_bin_url": "/runs/%s/weights.bin" % run["id"],
+        "dataset_key": run.get("dataset_key"),
         "base_model": run["base_model"],
         "imgsz": run["imgsz"],
         "batch_size": resolved_batch,
         "estimated_memory_mb": batch["memory_mb"],
         "epochs": 1,
         "seed": int(run.get("seed") or 0),
-        "warmup_epochs": run.get("warmup_epochs"),
+        "optimizer": run.get("optimizer") or "auto",
+        "lr0": run.get("lr0"),
+        "deterministic": bool(run.get("deterministic", True)),
+        "worker_validation": bool(run.get("worker_validation")),
+        "dataloader_workers": run.get("dataloader_workers"),
         "job_name": run["name"],
         "class_names": run["class_names"],
         "current_round": run["current_round"],
@@ -566,92 +835,160 @@ def _batch_payload(batch: dict, run: dict) -> dict:
         "samples": batch["samples"],
         "deadline_seconds": batch["hard_deadline_seconds"],
     }
+    # Omitted rather than sent as None, so a v4 worker keeps Ultralytics'
+    # default exactly as it did.
+    if warmup is not None:
+        payload["warmup_epochs"] = warmup
+    if payload["lr0"] is None:
+        payload.pop("lr0")
+    return payload
 
 
-@app.post("/submit_training_round_result")
-def submit_round_result(req: RoundResultRequest, _: str = Depends(require_mesh_token)):
+def _learn_from_result(node: dict, batch: dict, run: dict, elapsed: float, metrics: dict) -> None:
+    """Update the machine's cost model, per workload, from one finished shard.
+
+    The slope is the training loop alone: samples over the epoch time the
+    worker measured. The intercept is everything else in the round, from the
+    moment the shard was handed out to the moment its result arrived, which
+    covers transfer, model load, trainer construction, saving and upload.
+
+    A worker's first shard after it starts pays one-off costs, CUDA context
+    creation and cuDNN autotuning among them, that later rounds do not. Its
+    overhead is recorded but marked cold, and the first warm measurement
+    replaces it outright rather than being averaged with it, so one cold start
+    does not leave a machine looking slow for five rounds.
+    """
+    policy = current_policy()
+    key = workload_key(run["base_model"], run["imgsz"])
+    workloads = node.setdefault("workloads", {})
+    entry = workloads.setdefault(key, {"rate": 0.0, "fixed": 0.0, "rounds": 0})
+    samples = int(batch["samples"])
+
+    epoch_seconds = float(metrics.get("epoch_seconds") or 0.0)
+    train_seconds = float(metrics.get("train_seconds") or 0.0)
+    compute = epoch_seconds if epoch_seconds > 0 else (train_seconds if train_seconds > 0 else elapsed)
+    overhead = max(0.0, elapsed - compute)
+
+    entry["rate"] = update_throughput({"throughput_sps": entry.get("rate") or 0.0}, samples, compute, policy)
+    cold = bool(metrics.get("first_batch"))
+    if overhead > 0:
+        if entry.get("fixed_cold") and not cold:
+            entry["fixed"] = overhead
+            entry["fixed_cold"] = False
+        elif cold and float(entry.get("fixed") or 0.0) > 0:
+            pass  # a restart's cold round says nothing about steady overhead
+        else:
+            entry["fixed"] = update_fixed({"fixed_seconds": entry.get("fixed") or 0.0}, overhead, policy)
+            entry["fixed_cold"] = cold
+    entry["rounds"] = int(entry.get("rounds") or 0) + 1
+    entry["updated_at"] = time.time()
+
+    node["throughput_sps"] = entry["rate"]
+    node["fixed_seconds"] = entry.get("fixed") or 0.0
+    node["reliability"] = update_reliability(node, True, policy)
+    node["completed_rounds"] = node.get("completed_rounds", 0) + 1
+    node["consecutive_failures"] = 0
+    node["samples_trained"] = node.get("samples_trained", 0) + samples
+    node["seconds_trained"] = node.get("seconds_trained", 0.0) + elapsed
+    node["active_batches"] = 0
+    node["allocated_memory_mb"] = 0
+
+
+def _accept_result(batch_id: str, node_id: str, round_index: int, weights: bytes, metrics: dict) -> dict:
+    """Record one finished shard. Idempotent: a retried upload is acknowledged."""
     finished_at = time.time()
     with state_lock:
-        batch = batches.get(req.batch_id)
+        batch = batches.get(batch_id)
         if batch is None:
-            raise HTTPException(status_code=404, detail="Unknown batch")
-        if batch.get("node_id") != req.node_id:
+            raise HTTPException(status_code=404, detail="Unknown batch; its round has already closed")
+        if batch.get("node_id") != node_id:
             raise HTTPException(status_code=409, detail="Batch is not assigned to this node")
-        if batch["round_index"] != req.round_index:
+        if batch["round_index"] != round_index:
             raise HTTPException(status_code=400, detail="round_index does not match batch")
 
         if batch["status"] in {"done", "superseded"}:
-            # This shard already has a winner. Accept and discard.
-            return {"status": "superseded", "batch_id": req.batch_id}
+            # This shard already has a winner, or this is a retried upload of
+            # a result that already landed. Acknowledge and discard.
+            return {"status": "superseded", "batch_id": batch_id}
 
         elapsed = max(0.001, finished_at - float(batch.get("assigned_at") or finished_at))
         batch["status"] = "done"
         batch["finished_at"] = finished_at
         batch["elapsed_seconds"] = elapsed
-        batch["weights_b64"] = req.weights_b64
-        batch["metrics"] = req.metrics or {}
+        batch["weights"] = bytes(weights)
+        batch["metrics"] = metrics or {}
 
-        node = nodes.get(req.node_id)
-        if node is not None:
-            policy = current_policy()
-            # Throughput must measure compute, not the round.
-            #
-            # Round elapsed also contains the shard download, the checkpoint
-            # load, Ultralytics start-up and validation, all of which are fixed
-            # costs that do not scale with shard size. Dividing samples by it
-            # made a machine that had finished a round read at 2.1 samples/s
-            # while an identical machine that had only been probed read at 37,
-            # so the planner handed almost the whole dataset to whichever node
-            # had never run. The worker reports the time inside the training
-            # call, which is the quantity the probe estimates too, so the two
-            # are finally comparable.
-            metrics = req.metrics or {}
-            train_seconds = float(metrics.get("train_seconds") or 0.0)
-            measured_seconds = train_seconds if train_seconds > 0 else elapsed
-            node["throughput_sps"] = update_throughput(
-                node, batch["samples"], measured_seconds, policy
-            )
-            node["reliability"] = update_reliability(node, True, policy)
-            node["completed_rounds"] = node.get("completed_rounds", 0) + 1
-            node["consecutive_failures"] = 0
-            node["samples_trained"] = node.get("samples_trained", 0) + batch["samples"]
-            node["seconds_trained"] = node.get("seconds_trained", 0.0) + elapsed
-            node["active_batches"] = 0
-            node["allocated_memory_mb"] = 0
+        run = runs.get(batch["run_id"])
+        node = nodes.get(node_id)
+        if node is not None and run is not None:
+            _learn_from_result(node, batch, run, elapsed, metrics or {})
 
         # A speculative pair races for the same shard. The loser must leave the
         # barrier immediately, otherwise the round waits on work it no longer
         # needs.
         _supersede_twins_locked(batch)
-
-        run = runs.get(batch["run_id"])
         run_id = run["id"] if run else None
 
     emit(
         "shard.completed",
         {
             "run_id": run_id,
-            "batch_id": req.batch_id,
-            "node_id": req.node_id,
-            "round": req.round_index,
+            "batch_id": batch_id,
+            "node_id": node_id,
+            "round": round_index,
             "seconds": round(elapsed, 2),
             "samples": batch["samples"],
             "throughput_sps": round(batch["samples"] / elapsed, 3),
+            "epoch_seconds": (metrics or {}).get("epoch_seconds"),
+            "backend": (metrics or {}).get("backend"),
         },
     )
 
     if run_id:
         _maybe_close_round(run_id)
-    return {"status": "received", "batch_id": req.batch_id}
+    return {"status": "received", "batch_id": batch_id}
+
+
+@app.post("/batches/{batch_id}/result")
+async def submit_result_binary(
+    batch_id: str,
+    request: Request,
+    x_node_id: str = Header(...),
+    x_round_index: int = Header(...),
+    x_metrics: Optional[str] = Header(default=None),
+    _: str = Depends(require_mesh_token),
+):
+    """A finished shard as raw serialised weights. Metrics travel in a header."""
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="The result carried no weights")
+    metrics: dict = {}
+    if x_metrics:
+        try:
+            metrics = json.loads(base64.urlsafe_b64decode(x_metrics.encode("ascii")).decode("utf-8"))
+        except Exception:
+            metrics = {}
+    return await run_in_threadpool(_accept_result, batch_id, x_node_id, x_round_index, body, metrics)
+
+
+@app.post("/submit_training_round_result")
+def submit_round_result(req: RoundResultRequest, _: str = Depends(require_mesh_token)):
+    """The v4 wire format: base64 weights inside JSON."""
+    try:
+        weights = base64.b64decode(req.weights_b64.encode("ascii"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="weights_b64 is not valid base64")
+    return _accept_result(req.batch_id, req.node_id, req.round_index, weights, req.metrics or {})
 
 
 @app.post("/submit_training_batch_failure")
 def submit_batch_failure(req: BatchFailureRequest, _: str = Depends(require_mesh_token)):
+    capped = None
     with state_lock:
         batch = batches.get(req.batch_id)
         if batch is None:
             raise HTTPException(status_code=404, detail="Unknown batch")
-        if batch["status"] in {"done", "dropped"}:
+        if batch["status"] in {"done", "dropped", "superseded"}:
             return {"status": "ignored"}
         batch["status"] = "failed"
         batch["error"] = req.error[:4000]
@@ -664,14 +1001,92 @@ def submit_batch_failure(req: BatchFailureRequest, _: str = Depends(require_mesh
             node["consecutive_failures"] = int(node.get("consecutive_failures", 0) or 0) + 1
             node["active_batches"] = 0
             node["allocated_memory_mb"] = 0
+            lowered = req.error.lower()
+            if "out of memory" in lowered or "outofmemory" in lowered:
+                # The memory model guessed wrong for this machine. Halve its
+                # ceiling so the next round fits, rather than failing it again
+                # and quarantining a machine that only needed a smaller batch.
+                used = int(batch.get("resolved_batch_size") or batch.get("max_batch_size") or 2)
+                capped = max(1, used // 2)
+                node["batch_cap"] = capped
+                node["consecutive_failures"] = max(0, node["consecutive_failures"] - 1)
         run_id = batch["run_id"]
 
     emit(
         "shard.failed",
         {"run_id": run_id, "batch_id": req.batch_id, "node_id": req.node_id, "error": req.error[:400]},
     )
+    if capped is not None:
+        emit("node.batch_capped", {"node_id": req.node_id, "batch_size": capped})
+        _persist_nodes([req.node_id])
     _maybe_close_round(run_id)
     return {"status": "recorded"}
+
+
+# ---------------------------------------------------------------------------
+# Shards, weights and dataset files
+# ---------------------------------------------------------------------------
+
+
+class BundleRequest(BaseModel):
+    files: List[str] = Field(..., min_length=1, max_length=1000)
+
+
+_dirs_cache: Dict[str, Dict[str, Any]] = {}
+_shard_zip_lock = RLock()
+
+
+def _dataset_dirs(dataset: dict) -> Dict[str, Any]:
+    """Split directories for a dataset, cached because bundles ask repeatedly."""
+    cache_key = "%s|%s" % (dataset["id"], dataset.get("extracted_path"))
+    if cache_key not in _dirs_cache:
+        listing = sharding.list_split_images(Path(dataset["extracted_path"]), splits=dataset.get("splits"))
+        _dirs_cache[cache_key] = {key: (str(value) if value is not None else None) for key, value in listing["dirs"].items()}
+    return _dirs_cache[cache_key]
+
+
+@app.get("/runs/{run_id}/shards/{shard_index}/manifest")
+def get_shard_manifest(run_id: str, shard_index: int, _: str = Depends(require_mesh_token)):
+    """The files in one shard, with sizes, so a worker can check its cache."""
+    with state_lock:
+        run = runs.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Unknown run")
+        shards = run.get("shards") or []
+        if shard_index < 0 or shard_index >= len(shards):
+            raise HTTPException(status_code=404, detail="Unknown shard")
+        files = list(shards[shard_index]["files"])
+        dirs = dict(run["shard_dirs"])
+        dataset_key = run.get("dataset_key")
+        class_names = list(run["class_names"])
+    entries = sharding.shard_manifest(dirs, files)
+    return {"dataset_key": dataset_key, "files": entries, "class_names": class_names, "train_count": len(entries)}
+
+
+@app.post("/datasets/{dataset_id}/bundle")
+def get_dataset_bundle(dataset_id: str, req: BundleRequest, _: str = Depends(require_mesh_token)):
+    """A zip of just the image and label pairs a worker's cache is missing."""
+    dataset = store.get_dataset(dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Unknown dataset")
+    if not dataset.get("available"):
+        raise HTTPException(status_code=410, detail="This dataset's files are not on the host any more")
+    dirs = _dataset_dirs(dataset)
+    import tempfile
+
+    handle, temp_path = tempfile.mkstemp(suffix=".zip", prefix="gradmesh-bundle-")
+    os.close(handle)
+    try:
+        sharding.write_bundle(dirs, req.files, Path(temp_path))
+    except ValueError as exc:
+        Path(temp_path).unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc))
+    return FileResponse(
+        temp_path,
+        media_type="application/zip",
+        filename="bundle.zip",
+        background=BackgroundTask(lambda: Path(temp_path).unlink(missing_ok=True)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +1101,12 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
         raise HTTPException(
             status_code=400,
             detail="No dataset is available. Upload one from the Datasets page first.",
+        )
+    if not dataset.get("available", True):
+        raise HTTPException(
+            status_code=400,
+            detail="%s is registered but its files are not on this machine. Upload it again, or re-import it."
+            % dataset.get("name", "That dataset"),
         )
 
     model_path = store.MODELS_DIR / Path(req.base_model).name
@@ -702,11 +1123,17 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
             detail="The training plane is still installing. Aggregation needs torch on the host.",
         )
 
-    if req.partition_strategy not in {PARTITION_PROPORTIONAL, PARTITION_EQUAL}:
+    if req.partition_strategy not in PARTITION_STRATEGIES:
         raise HTTPException(
             status_code=400,
-            detail="partition_strategy must be %s or %s" % (PARTITION_PROPORTIONAL, PARTITION_EQUAL),
+            detail="partition_strategy must be one of %s" % ", ".join(PARTITION_STRATEGIES),
         )
+    if req.warmup_mode not in WARMUP_MODES:
+        raise HTTPException(status_code=400, detail="warmup_mode must be one of %s" % ", ".join(WARMUP_MODES))
+    backends = sorted({backend for backend in (req.backends or []) if backend})
+    unknown = [backend for backend in backends if backend not in BACKENDS]
+    if unknown:
+        raise HTTPException(status_code=400, detail="Unknown backend %s" % ", ".join(unknown))
 
     manifest = dataset.get("manifest_path")
     dataset_root = Path(dataset["extracted_path"])
@@ -729,6 +1156,9 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
         "started_at": now,
         "finished_at": None,
         "dataset_id": dataset["id"],
+        # Workers cache images per dataset key. Subsets share their parent's
+        # files, so they share its cache too.
+        "dataset_key": dataset.get("parent_id") or dataset["id"],
         "dataset_name": dataset["name"],
         "class_names": dataset.get("class_names") or ["object"],
         "total_samples": total_samples,
@@ -736,6 +1166,7 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
         "dataset_root": str(dataset_root),
         "dataset_splits": dataset_splits,
         "node_ids": req.node_ids,
+        "backends": backends or None,
         "partition_strategy": req.partition_strategy,
         "seed": int(req.seed),
         "evaluate": bool(req.evaluate),
@@ -745,17 +1176,25 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
         "eval_seconds_total": 0.0,
         "comm_bytes_total": 0,
         "base_model": Path(req.base_model).name,
+        "workload": workload_key(req.base_model, req.imgsz),
         "rounds": req.rounds,
         "current_round": 0,
         "imgsz": req.imgsz,
         "batch_size": req.batch_size,
+        "warmup_mode": req.warmup_mode,
         "warmup_epochs": req.warmup_epochs,
+        "optimizer": req.optimizer,
+        "lr0": req.lr0,
+        "deterministic": req.deterministic,
+        "worker_validation": req.worker_validation,
+        "dataloader_workers": req.dataloader_workers,
         "notes": req.notes,
-        "weights_b64": None,
+        "weights": None,
         "round_history": [],
         "plan": None,
         "error": None,
         "shards": [],
+        "reference_stack": dict(REFERENCE_STACK),
     }
     with state_lock:
         runs[run_id] = run
@@ -782,7 +1221,8 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
 def list_runs(_: str = Depends(require_mesh_token)):
     with state_lock:
         live = [_run_summary(run) for run in runs.values()]
-    archived = [run for run in store.list_runs() if run["id"] not in {r["id"] for r in live}]
+    live_ids = {r["id"] for r in live}
+    archived = [run for run in store.list_runs() if run["id"] not in live_ids]
     combined = live + archived
     combined.sort(key=lambda item: item.get("created_at") or 0, reverse=True)
     return {"runs": combined}
@@ -796,6 +1236,7 @@ def get_run(run_id: str, _: str = Depends(require_mesh_token)):
     archived = store.get_run(run_id)
     if archived is None:
         raise HTTPException(status_code=404, detail="Unknown run")
+    archived.setdefault("live_shards", [])
     return archived
 
 
@@ -816,8 +1257,25 @@ def stop_run(run_id: str, _: str = Depends(require_mesh_token)):
     return {"status": "stopped"}
 
 
+@app.delete("/runs/{run_id}")
+def delete_run_record(run_id: str, _: str = Depends(require_mesh_token)):
+    with state_lock:
+        if run_id in runs and runs[run_id]["status"] in {"running", "planning", "waiting"}:
+            raise HTTPException(status_code=409, detail="Stop the run before deleting it")
+        runs.pop(run_id, None)
+    if not store.delete_run(run_id):
+        raise HTTPException(status_code=404, detail="Unknown run")
+    emit("run.deleted", {"run_id": run_id})
+    return {"status": "deleted"}
+
+
 @app.get("/runs/{run_id}/shards/{shard_index}.zip")
 def get_shard(run_id: str, shard_index: int, _: str = Depends(require_mesh_token)):
+    """The v4 shard archive, for agents that do not cache images.
+
+    Built on first request and kept for the round, so a v5-only mesh never
+    pays for it, and a speculative clone of the same shard reuses it.
+    """
     with state_lock:
         run = runs.get(run_id)
         if run is None:
@@ -825,29 +1283,64 @@ def get_shard(run_id: str, shard_index: int, _: str = Depends(require_mesh_token
         shards = run.get("shards") or []
         if shard_index < 0 or shard_index >= len(shards):
             raise HTTPException(status_code=404, detail="Unknown shard")
-        zip_path = Path(shards[shard_index]["zip_path"])
-    if not zip_path.is_file():
-        raise HTTPException(status_code=404, detail="Shard archive is missing")
-    return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)
+        shard = shards[shard_index]
+        round_dir = store.run_dir(run_id) / ("round_%d" % run["current_round"])
+        dirs = dict(run["shard_dirs"])
+        val_images = [Path(path) for path in run.get("shard_val") or []]
+        class_names = list(run["class_names"])
+    target = round_dir / ("shard_%d.zip" % shard_index)
+    with _shard_zip_lock:
+        if not target.is_file():
+            workdir = round_dir / ("build_%d" % shard_index)
+            workdir.mkdir(parents=True, exist_ok=True)
+            built = sharding.materialize_shard_zip(dirs, shard["files"], val_images, class_names, workdir)
+            os.replace(built, target)
+            shutil.rmtree(workdir, ignore_errors=True)
+    with state_lock:
+        for batch in batches.values():
+            if batch["run_id"] == run_id and batch["shard_index"] == shard_index and batch["status"] == "assigned":
+                batch["shard_bytes"] = target.stat().st_size
+    return FileResponse(target, media_type="application/zip", filename=target.name)
 
 
-@app.get("/runs/{run_id}/weights")
-def get_run_weights(run_id: str, _: str = Depends(require_mesh_token)):
+def _charge_weights_download(run_id: str, size: int) -> None:
+    """Attribute a global-weights download to the shards in flight on this run."""
+    if not size:
+        return
+    for batch in batches.values():
+        if batch["run_id"] == run_id and batch["status"] == "assigned" and not batch.get("weights_in_bytes"):
+            batch["weights_in_bytes"] = size
+
+
+@app.get("/runs/{run_id}/weights.bin")
+def get_run_weights_binary(run_id: str, _: str = Depends(require_mesh_token)):
+    """Current global weights as raw bytes. 204 before the first aggregation."""
     with state_lock:
         run = runs.get(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Unknown run")
-        # Charge this transfer to whichever shard is currently assigned on this
-        # run, so communication accounting includes the download leg.
-        pulled = evaluation.decoded_size_bytes(run.get("weights_b64"))
-        if pulled:
-            for batch in batches.values():
-                if batch["run_id"] == run_id and batch["status"] == "assigned":
-                    batch["weights_in_bytes"] = pulled
+        weights = run.get("weights")
+        round_index = run["current_round"]
+        _charge_weights_download(run_id, len(weights or b""))
+    headers = {"X-Round": str(round_index)}
+    if not weights:
+        return Response(status_code=204, headers=headers)
+    return Response(content=weights, media_type="application/octet-stream", headers=headers)
+
+
+@app.get("/runs/{run_id}/weights")
+def get_run_weights(run_id: str, _: str = Depends(require_mesh_token)):
+    """The v4 wire format: current global weights as base64 inside JSON."""
+    with state_lock:
+        run = runs.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Unknown run")
+        weights = run.get("weights")
+        _charge_weights_download(run_id, len(weights or b""))
         return {
             "job_id": run_id,
             "base_model": run["base_model"],
-            "weights_b64": run.get("weights_b64"),
+            "weights_b64": base64.b64encode(weights).decode("ascii") if weights else None,
             "round": run["current_round"],
         }
 
@@ -858,9 +1351,9 @@ def download_artifact(run_id: str, _: str = Depends(require_mesh_token)):
     path = store.run_dir(run_id) / "global.pt"
     if not path.is_file():
         record = store.get_run(run_id)
-        if record is None:
+        if record is None and run_id not in runs:
             raise HTTPException(status_code=404, detail="No artifact for this run yet")
-        raise HTTPException(status_code=404, detail="This run finished without producing weights")
+        raise HTTPException(status_code=404, detail="This run has not produced weights yet")
     return FileResponse(path, media_type="application/octet-stream", filename="%s.pt" % run_id)
 
 
@@ -870,7 +1363,7 @@ def download_artifact(run_id: str, _: str = Depends(require_mesh_token)):
 
 
 def _start_round(run_id: str) -> None:
-    """Plan, materialise and queue one round of shards."""
+    """Plan one round and queue its shards. No files are copied."""
     policy = current_policy()
 
     with state_lock:
@@ -878,18 +1371,26 @@ def _start_round(run_id: str) -> None:
         if run is None or run["status"] in {"stopped", "failed", "done"}:
             return
         _refresh_liveness(time.time())
-        pool = [dict(node) for node in nodes.values()]
+        key = run.get("workload") or workload_key(run["base_model"], run["imgsz"])
+        # Plan against this run's workload, so a machine measured at 640 px is
+        # not planned with its 320 px speed.
+        pool = [_with_workload(node, key) for node in nodes.values()]
         round_index = run["current_round"]
         total_samples = run["total_samples"]
         mode = run["mode"]
         allowlist = run.get("node_ids")
+        wanted_backends = set(run.get("backends") or [])
         strategy = run.get("partition_strategy", PARTITION_PROPORTIONAL)
 
     candidates = [node for node in pool if node.get("active") and node.get("supports_training", True)]
+    # Machines mid-way through someone else's shard are not idle.
+    candidates = [node for node in candidates if not _busy_elsewhere(node["node_id"], run_id)]
 
     if allowlist:
         wanted = set(allowlist)
         candidates = [node for node in candidates if node["node_id"] in wanted]
+    if wanted_backends:
+        candidates = [node for node in candidates if node.get("backend") in wanted_backends]
 
     if mode == "solo" and candidates:
         mesh = mesh_reference(candidates)
@@ -901,18 +1402,12 @@ def _start_round(run_id: str) -> None:
         with state_lock:
             run["status"] = "waiting"
             run["plan"] = plan.as_dict()
-        emit(
-            "run.waiting",
-            {
-                "run_id": run_id,
-                "reason": (
-                    "none of the %d requested machines are eligible" % len(allowlist)
-                    if allowlist
-                    else "no eligible worker is online"
-                ),
-                "rejected": plan.rejected,
-            },
-        )
+        reason = "no eligible worker is online"
+        if allowlist:
+            reason = "none of the %d requested machines are eligible" % len(allowlist)
+        elif wanted_backends:
+            reason = "no eligible %s machine is online" % " or ".join(sorted(wanted_backends))
+        emit("run.waiting", {"run_id": run_id, "reason": reason, "rejected": plan.rejected})
         return
 
     dataset = store.get_dataset(run["dataset_id"])
@@ -920,35 +1415,37 @@ def _start_round(run_id: str) -> None:
         raise RuntimeError("The dataset for this run was deleted")
 
     sizes = [assignment.samples for assignment in plan.assignments]
-    shard_dir = store.run_dir(run_id) / ("round_%d" % round_index)
 
-    # Shards are rebuilt every round rather than reused, even when the plan did
-    # not move. The seed is the round index, so each round reshuffles the pool
-    # before splitting it. Reusing last round's shards would hand every worker
-    # the same images every time, which is exactly the class-correlated split
-    # that biases local gradients before aggregation sees them.
-    if shard_dir.exists():
-        shutil.rmtree(shard_dir, ignore_errors=True)
+    # Shards are re-drawn every round, even when the plan did not move. The seed
+    # is the round index, so each round reshuffles the pool before splitting it.
+    # Reusing last round's split would hand every worker the same images every
+    # time, which is exactly the class-correlated split that biases local
+    # gradients before aggregation sees them.
     run_manifest = run.get("dataset_manifest")
-    shards = sharding.build_proportional_shards(
+    planned = sharding.plan_shard_lists(
         Path(dataset["extracted_path"]),
-        shard_dir,
         sizes,
-        run["class_names"],
         seed=round_index + int(run.get("seed") or 0) * 1009,
         manifest=Path(run_manifest) if run_manifest else None,
         splits=run.get("dataset_splits"),
     )
+    dirs = {name: (str(value) if value is not None else None) for name, value in planned["dirs"].items()}
+    shards = [
+        {"shard_index": index, "files": files, "train_count": len(files)}
+        for index, files in enumerate(planned["groups"])
+    ]
     _prune_old_rounds(run_id, round_index)
 
     now = time.time()
     created: List[dict] = []
-    throughput_by_node = {node["node_id"]: float(node.get("throughput_sps") or 0.0) for node in pool}
+    by_id = {node["node_id"]: node for node in pool}
 
     for assignment, shard in zip(plan.assignments, shards):
-        # A node that has never finished a round is still paying setup costs, so
-        # it gets the cold-start grace period rather than a probe-derived one.
-        cold = throughput_by_node.get(assignment.node_id, 0.0) <= 0.0
+        node = by_id.get(assignment.node_id, {})
+        # A node that has never finished a round of this workload is still
+        # paying setup costs, so it gets the cold-start grace period rather
+        # than a deadline derived from an estimate it has not earned.
+        cold = float(node.get("throughput_sps") or 0.0) <= 0.0
         deadline = deadline_for(assignment.predicted_seconds, policy, cold=cold)
         batch_id = uuid.uuid4().hex[:12]
         created.append(
@@ -956,6 +1453,7 @@ def _start_round(run_id: str) -> None:
                 "batch_id": batch_id,
                 "run_id": run_id,
                 "node_id": assignment.node_id,
+                "backend": node.get("backend"),
                 "round_index": round_index,
                 "shard_index": shard["shard_index"],
                 "samples": shard["train_count"],
@@ -963,6 +1461,7 @@ def _start_round(run_id: str) -> None:
                 "tier": assignment.tier,
                 "fitness": assignment.fitness,
                 "predicted_seconds": assignment.predicted_seconds,
+                "predicted_fixed_seconds": assignment.fixed_seconds,
                 "soft_deadline_seconds": deadline.soft_seconds,
                 "hard_deadline_seconds": deadline.hard_seconds,
                 "queued_at": now,
@@ -970,19 +1469,14 @@ def _start_round(run_id: str) -> None:
                 "finished_at": None,
                 "elapsed_seconds": None,
                 "memory_mb": max(1024, run["batch_size"] * 160),
-                "max_batch_size": next(
-                    (n.get("max_batch_size", run["batch_size"]) for n in pool if n["node_id"] == assignment.node_id),
-                    run["batch_size"],
-                ),
-                "device_memory_mb": next(
-                    (n.get("gpu_memory_mb", 0) for n in pool if n["node_id"] == assignment.node_id),
-                    0,
-                ),
-                "weights_b64": None,
+                "max_batch_size": _node_batch_ceiling(node, run["batch_size"]),
+                "device_memory_mb": node.get("gpu_memory_mb", 0),
+                "unified_memory": bool((node.get("capability") or {}).get("unified_memory")),
+                "weights": None,
                 "metrics": None,
                 "error": None,
                 "speculative_for": None,
-                "shard_bytes": int(shard.get("bytes") or 0),
+                "shard_bytes": 0,
                 "weights_in_bytes": 0,
             }
         )
@@ -991,6 +1485,8 @@ def _start_round(run_id: str) -> None:
         run["status"] = "running"
         run["plan"] = plan.as_dict()
         run["shards"] = shards
+        run["shard_dirs"] = dirs
+        run["shard_val"] = [str(path) for path in planned["val"]]
         run["shard_sizes"] = sizes
         run["round_started_at"] = now
         run["last_progress_at"] = now
@@ -1006,6 +1502,17 @@ def _start_round(run_id: str) -> None:
             "plan": plan.as_dict(),
         },
     )
+
+
+def _busy_elsewhere(node_id: str, run_id: str) -> bool:
+    """Is this machine holding a shard for a different run right now?"""
+    with state_lock:
+        return any(
+            batch.get("node_id") == node_id
+            and batch["run_id"] != run_id
+            and batch["status"] in {"queued", "assigned"}
+            for batch in batches.values()
+        )
 
 
 def _prune_old_rounds(run_id: str, keep_round: int) -> None:
@@ -1076,7 +1583,7 @@ def _maybe_close_round(run_id: str) -> None:
         done = [
             batch
             for batch in round_batches
-            if batch["status"] == "done" and batch.get("weights_b64")
+            if batch["status"] == "done" and batch.get("weights")
         ]
         finished_shards = {batch["shard_index"] for batch in done}
         lost = [
@@ -1159,6 +1666,28 @@ def _clear_round(run_id: str, round_index: Optional[int] = None) -> None:
             batches.pop(batch_id, None)
 
 
+def _shard_breakdown(batch: dict) -> Dict[str, float]:
+    """Where one shard's time went, from the worker's phase timings."""
+    metrics = batch.get("metrics") or {}
+    elapsed = float(batch.get("elapsed_seconds") or 0.0)
+    epoch = float(metrics.get("epoch_seconds") or 0.0)
+    train = float(metrics.get("train_seconds") or 0.0)
+    compute = epoch if epoch > 0 else train
+    total = float(metrics.get("total_seconds") or 0.0)
+    if "download_seconds" in metrics:
+        transfer = float(metrics.get("download_seconds") or 0.0) + max(0.0, elapsed - total)
+    else:
+        # A v4 worker reported only its training call; the rest was transfer
+        # and setup together.
+        transfer = max(0.0, elapsed - train)
+    return {
+        "elapsed": elapsed,
+        "compute": compute,
+        "overhead": max(0.0, elapsed - compute) if compute > 0 else 0.0,
+        "transfer": transfer,
+    }
+
+
 def _aggregate_round(run_id: str, round_index: int) -> None:
     """Sample-weighted FedAvg. Runs off the event loop because torch blocks."""
     started = time.time()
@@ -1168,70 +1697,93 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
             return
         round_batches = _round_batches(run_id, round_index)
         done = _unique_by_shard(
-            [
-                batch
-                for batch in round_batches
-                if batch["status"] == "done" and batch.get("weights_b64")
-            ]
+            [batch for batch in round_batches if batch["status"] == "done" and batch.get("weights")]
         )
+        finished_shards = {batch["shard_index"] for batch in done}
+        lost_shards = {
+            batch["shard_index"]
+            for batch in round_batches
+            if batch["status"] in {"failed", "dropped"} and batch["shard_index"] not in finished_shards
+        }
+        speculated = sum(1 for batch in round_batches if batch.get("speculative_for"))
         results = [
             {
                 "batch_id": batch["batch_id"],
                 "samples": batch["samples"],
                 "reliability": (nodes.get(batch["node_id"]) or {}).get("reliability", 1.0),
-                "weights_b64": batch["weights_b64"],
+                "weights": batch["weights"],
             }
             for batch in done
         ]
         round_started_at = run.get("round_started_at", started)
+        plan = run.get("plan") or {}
 
     try:
         weights = aggregation_weights(results)
-        encoded = aggregation.aggregate(results, weights)
+        aggregated = aggregation.aggregate(results, weights)
     except Exception as exc:
         _fail_round(run_id, "aggregation failed: %s: %s" % (type(exc).__name__, exc))
         return
 
     aggregation_seconds = time.time() - started
-    makespan = max((batch.get("elapsed_seconds") or 0.0) for batch in done) if done else 0.0
-    fastest = min((batch.get("elapsed_seconds") or 0.0) for batch in done) if done else 0.0
-    serial_estimate = sum(batch.get("elapsed_seconds") or 0.0 for batch in done)
+    breakdown = {batch["batch_id"]: _shard_breakdown(batch) for batch in done}
+    shard_times = [breakdown[batch["batch_id"]]["elapsed"] for batch in done]
+    makespan = max(shard_times, default=0.0)
+    fastest = min(shard_times, default=0.0)
+    serial_estimate = sum(shard_times)
     wall_clock = time.time() - round_started_at
-    shard_times = [batch.get("elapsed_seconds") or 0.0 for batch in done]
 
-    # Communication accounting. Every worker pulls a shard and the current
-    # global weights, then pushes its updated weights back. Reported as bytes
-    # and as a share of round wall clock, because "how much of the round was
-    # network" is the number that decides whether this scales past a LAN.
-    shard_bytes = sum(int(batch.get("shard_bytes") or 0) for batch in done)
-    weights_down = sum(int(batch.get("weights_in_bytes") or 0) for batch in done)
-    weights_up = sum(
-        evaluation.decoded_size_bytes(batch.get("weights_b64")) for batch in done
-    )
-    comm_bytes = shard_bytes + weights_down + weights_up
-    # Workers report their own train time, so anything else they spent in the
-    # round was transfer and setup.
-    comm_seconds = sum(
-        max(0.0, (batch.get("elapsed_seconds") or 0.0) - float((batch.get("metrics") or {}).get("train_seconds") or 0.0))
-        for batch in done
-    )
+    # Communication accounting. Every worker pulls its images and the current
+    # global weights, then pushes its updated weights back. v5 workers report
+    # what they actually downloaded, which after the first round is mostly
+    # just the weights, because their image cache already holds the shard.
+    bytes_down = 0
+    for batch in done:
+        metrics = batch.get("metrics") or {}
+        if metrics.get("bytes_in") is not None:
+            bytes_down += int(metrics.get("bytes_in") or 0)
+        else:
+            bytes_down += int(batch.get("shard_bytes") or 0) + int(batch.get("weights_in_bytes") or 0)
+    bytes_up = sum(len(batch.get("weights") or b"") for batch in done)
+    comm_bytes = bytes_down + bytes_up
+    comm_seconds = sum(item["transfer"] for item in breakdown.values())
+    overhead_seconds = [item["overhead"] for item in breakdown.values() if item["overhead"] > 0]
+
+    by_backend: Dict[str, dict] = {}
+    for batch in done:
+        backend = batch.get("backend") or (batch.get("metrics") or {}).get("backend") or "unknown"
+        entry = by_backend.setdefault(
+            backend, {"workers": 0, "samples": 0, "seconds": 0.0, "compute_seconds": 0.0, "weight": 0.0}
+        )
+        entry["workers"] += 1
+        entry["samples"] += batch["samples"]
+        entry["seconds"] = round(entry["seconds"] + breakdown[batch["batch_id"]]["elapsed"], 2)
+        entry["compute_seconds"] = round(entry["compute_seconds"] + breakdown[batch["batch_id"]]["compute"], 2)
+        entry["weight"] = round(entry["weight"] + weights.get(batch["batch_id"], 0.0), 4)
 
     record = {
         "round": round_index,
         "workers": len(done),
         "samples": sum(batch["samples"] for batch in done),
-        "dropped_shards": len(round_batches) - len(done),
+        # Distinct slices of the dataset that were lost, not batch records: a
+        # speculative clone that lost its race is not a dropped shard. Leg 1
+        # reported a dropped shard in a single-worker round because of this.
+        "dropped_shards": len(lost_shards),
+        "speculated_shards": speculated,
         "makespan_seconds": round(makespan, 2),
         "fastest_seconds": round(fastest, 2),
         "straggler_gap_seconds": round(makespan - fastest, 2),
         "aggregation_seconds": round(aggregation_seconds, 2),
         "wall_clock_seconds": round(wall_clock, 2),
         "imbalance": round(imbalance(shard_times), 4),
-        "predicted_imbalance": float((run.get("plan") or {}).get("predicted_imbalance") or 0.0),
+        "predicted_imbalance": float(plan.get("predicted_imbalance") or 0.0),
+        "predicted_makespan_seconds": float(plan.get("predicted_makespan_seconds") or 0.0),
         "comm_bytes": comm_bytes,
         "comm_seconds": round(comm_seconds, 2),
         "comm_fraction": round(comm_seconds / (serial_estimate or 1.0), 4),
+        "mean_overhead_seconds": round(sum(overhead_seconds) / len(overhead_seconds), 2) if overhead_seconds else None,
         "strategy": run.get("partition_strategy", PARTITION_PROPORTIONAL),
+        "by_backend": by_backend,
         # Serial time is the sum of the shard times actually observed, which is
         # what one machine would have spent doing all of this work at the
         # measured per-shard rates.
@@ -1242,9 +1794,13 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
             {
                 "node_id": batch["node_id"],
                 "node_name": (nodes.get(batch["node_id"]) or {}).get("display_name"),
+                "backend": batch.get("backend"),
                 "samples": batch["samples"],
-                "seconds": round(batch.get("elapsed_seconds") or 0.0, 2),
+                "seconds": round(breakdown[batch["batch_id"]]["elapsed"], 2),
+                "compute_seconds": round(breakdown[batch["batch_id"]]["compute"], 2),
+                "overhead_seconds": round(breakdown[batch["batch_id"]]["overhead"], 2),
                 "predicted_seconds": batch["predicted_seconds"],
+                "predicted_fixed_seconds": batch.get("predicted_fixed_seconds"),
                 "tier": batch["tier"],
                 "weight": round(weights.get(batch["batch_id"], 0.0), 4),
                 "metrics": batch.get("metrics"),
@@ -1253,7 +1809,7 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
         ],
     }
 
-    accuracy = _evaluate_round(run_id, encoded, round_index)
+    accuracy = _evaluate_round(run_id, aggregated, round_index)
     if accuracy:
         record["accuracy"] = accuracy
 
@@ -1261,7 +1817,7 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
         run = runs.get(run_id)
         if run is None:
             return
-        run["weights_b64"] = encoded
+        run["weights"] = aggregated
         run["comm_bytes_total"] = int(run.get("comm_bytes_total", 0)) + comm_bytes
         if accuracy and accuracy.get("ok"):
             run["eval_seconds_total"] = float(run.get("eval_seconds_total", 0.0)) + float(
@@ -1292,8 +1848,9 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
             run["finished_at"] = time.time()
 
     _clear_round(run_id, round_index)
-    _write_artifact(run_id, encoded)
-    emit("round.completed", {"run_id": run_id, **record})
+    _write_artifact(run_id, aggregated)
+    _persist_nodes([batch["node_id"] for batch in done])
+    emit("round.completed", {"run_id": run_id, **{k: v for k, v in record.items() if k != "shards"}})
 
     if finished:
         emit("run.completed", {"run_id": run_id, "summary": _run_summary(runs[run_id])})
@@ -1302,7 +1859,7 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
         _start_round(run_id)
 
 
-def _evaluate_round(run_id: str, encoded_weights: str, round_index: int) -> Optional[dict]:
+def _evaluate_round(run_id: str, weights: bytes, round_index: int) -> Optional[dict]:
     """Score the aggregated model, if this run asked for it.
 
     Runs on the aggregator thread, after the round's wall clock has been
@@ -1324,7 +1881,7 @@ def _evaluate_round(run_id: str, encoded_weights: str, round_index: int) -> Opti
             dataset_root, workdir / "eval.yaml", class_names, splits=dataset_splits
         )
         result = evaluation.evaluate_weights(
-            weights_b64=encoded_weights,
+            weights_b64=weights,
             base_model_path=store.MODELS_DIR / base_model,
             eval_yaml=eval_yaml,
             imgsz=imgsz,
@@ -1383,10 +1940,12 @@ def _fail_suite(suite_id: str, reason: str) -> None:
     emit("suite.finished", {"suite_id": suite_id, "status": "failed", "error": reason})
 
 
-def _write_artifact(run_id: str, encoded_weights: str) -> None:
+def _write_artifact(run_id: str, weights: bytes) -> None:
     try:
         path = store.run_dir(run_id) / "global.pt"
-        path.write_bytes(base64.b64decode(encoded_weights.encode("ascii")))
+        temporary = path.with_suffix(".tmp")
+        temporary.write_bytes(weights)
+        os.replace(temporary, path)
     except Exception:
         # An unwritable artifact must not fail a run that otherwise succeeded.
         pass
@@ -1402,6 +1961,7 @@ def _archive_run(run_id: str) -> None:
         record["plan"] = run.get("plan")
         record["error"] = run.get("error")
         record["notes"] = run.get("notes")
+        record["class_names"] = run.get("class_names")
     store.put_run(record)
     try:
         (store.run_dir(run_id) / "summary.json").write_text(
@@ -1409,6 +1969,20 @@ def _archive_run(run_id: str) -> None:
         )
     except Exception:
         pass
+
+
+def _backend_totals(history: Sequence[dict]) -> Dict[str, dict]:
+    totals: Dict[str, dict] = {}
+    for item in history:
+        for backend, entry in (item.get("by_backend") or {}).items():
+            total = totals.setdefault(backend, {"samples": 0, "seconds": 0.0, "compute_seconds": 0.0, "rounds": 0})
+            total["samples"] += int(entry.get("samples") or 0)
+            total["seconds"] = round(total["seconds"] + float(entry.get("seconds") or 0.0), 2)
+            total["compute_seconds"] = round(total["compute_seconds"] + float(entry.get("compute_seconds") or 0.0), 2)
+            total["rounds"] += 1
+    for total in totals.values():
+        total["throughput_sps"] = round(total["samples"] / total["compute_seconds"], 3) if total["compute_seconds"] else None
+    return totals
 
 
 def _run_summary(run: dict) -> dict:
@@ -1444,6 +2018,15 @@ def _run_summary(run: dict) -> dict:
         "partition_strategy": run.get("partition_strategy", PARTITION_PROPORTIONAL),
         "seed": run.get("seed", 0),
         "node_ids": run.get("node_ids"),
+        "backends": run.get("backends"),
+        "warmup_mode": run.get("warmup_mode", "every-round"),
+        "warmup_epochs": run.get("warmup_epochs"),
+        "optimizer": run.get("optimizer", "auto"),
+        "lr0": run.get("lr0"),
+        "worker_validation": bool(run.get("worker_validation")),
+        "evaluate": bool(run.get("evaluate")),
+        "reference_stack": run.get("reference_stack"),
+        "backend_totals": _backend_totals(history),
         "suite_id": run.get("suite_id"),
         "trial_id": run.get("trial_id"),
         "map50": latest.get("map50") if latest else None,
@@ -1453,6 +2036,7 @@ def _run_summary(run: dict) -> dict:
         "eval_seconds_total": round(float(run.get("eval_seconds_total", 0.0)), 2),
         "comm_bytes_total": int(run.get("comm_bytes_total", 0)),
         "mean_imbalance": round(sum(imbalances) / len(imbalances), 4) if imbalances else None,
+        "error": run.get("error"),
     }
 
 
@@ -1465,31 +2049,42 @@ def _run_view(run_id: str) -> dict:
         view["error"] = run.get("error")
         view["notes"] = run.get("notes")
         view["class_names"] = run["class_names"]
-        view["live_shards"] = [
-            {
-                "batch_id": batch["batch_id"],
-                "node_id": batch["node_id"],
-                "node_name": (nodes.get(batch["node_id"]) or {}).get("display_name"),
-                "status": batch["status"],
-                "samples": batch["samples"],
-                "tier": batch["tier"],
-                "round": batch["round_index"],
-                "predicted_seconds": batch["predicted_seconds"],
-                "batch_size": safe_batch_size(
-                    device_memory_mb=batch.get("device_memory_mb") or 0,
-                    imgsz=run["imgsz"],
-                    requested=run["batch_size"],
-                    node_max=batch.get("max_batch_size"),
-                ),
-                "elapsed_seconds": round(time.time() - batch["assigned_at"], 1)
-                if batch.get("assigned_at") and batch["status"] == "assigned"
-                else batch.get("elapsed_seconds"),
-                "soft_deadline_seconds": batch["soft_deadline_seconds"],
-                "hard_deadline_seconds": batch["hard_deadline_seconds"],
-                "error": batch.get("error"),
-            }
-            for batch in _round_batches(run_id, run["current_round"])
-        ]
+        now = time.time()
+        live = []
+        for batch in _round_batches(run_id, run["current_round"]):
+            node = nodes.get(batch["node_id"]) or {}
+            live.append(
+                {
+                    "batch_id": batch["batch_id"],
+                    "node_id": batch["node_id"],
+                    "node_name": node.get("display_name"),
+                    "backend": batch.get("backend") or node.get("backend"),
+                    "status": batch["status"],
+                    "samples": batch["samples"],
+                    "tier": batch["tier"],
+                    "round": batch["round_index"],
+                    "predicted_seconds": batch["predicted_seconds"],
+                    "predicted_fixed_seconds": batch.get("predicted_fixed_seconds"),
+                    "batch_size": batch.get("resolved_batch_size")
+                    or safe_batch_size(
+                        device_memory_mb=batch.get("device_memory_mb") or 0,
+                        imgsz=run["imgsz"],
+                        requested=run["batch_size"],
+                        node_max=batch.get("max_batch_size"),
+                        unified_memory=bool(batch.get("unified_memory")),
+                    ),
+                    "elapsed_seconds": round(now - batch["assigned_at"], 1)
+                    if batch.get("assigned_at") and batch["status"] == "assigned"
+                    else batch.get("elapsed_seconds"),
+                    "soft_deadline_seconds": batch["soft_deadline_seconds"],
+                    "hard_deadline_seconds": batch["hard_deadline_seconds"],
+                    "phase": node.get("phase") if batch["status"] == "assigned" else None,
+                    "progress": node.get("progress") if batch["status"] == "assigned" else None,
+                    "speculative": bool(batch.get("speculative_for")),
+                    "error": batch.get("error"),
+                }
+            )
+        view["live_shards"] = live
         return view
 
 
@@ -1569,13 +2164,33 @@ def _supervise_once() -> None:
                 to_close.append(batch["run_id"])
                 continue
 
-            backup = next(
-                (
-                    candidate
-                    for candidate in idle_nodes
-                    if candidate["node_id"] != batch["node_id"] and not batch.get("speculated")
+            # A backup must be a machine this run is allowed to use. v4 picked
+            # any idle machine, so a benchmark trial restricted to two nodes
+            # could quietly finish on a third, which is a different experiment.
+            run_for_batch = runs.get(batch["run_id"]) or {}
+            allowed_ids = set(run_for_batch.get("node_ids") or [])
+            allowed_backends = set(run_for_batch.get("backends") or [])
+            eligible_backups = [
+                candidate
+                for candidate in idle_nodes
+                if candidate["node_id"] != batch["node_id"]
+                and not batch.get("speculated")
+                and not batch.get("speculative_for")
+                and (not allowed_ids or candidate["node_id"] in allowed_ids)
+                and (not allowed_backends or candidate.get("backend") in allowed_backends)
+                and float((candidate.get("capability") or {}).get("gflops") or 0.0) > 0
+                and run_for_batch.get("mode") != "solo"
+            ]
+            # The fastest idle machine for this workload makes the best backup.
+            workload = run_for_batch.get("workload")
+            backup = max(
+                eligible_backups,
+                key=lambda candidate: float(
+                    ((candidate.get("workloads") or {}).get(workload) or {}).get("rate")
+                    or (candidate.get("capability") or {}).get("gflops")
+                    or 0.0
                 ),
-                None,
+                default=None,
             )
             action = straggler_action(elapsed, deadline, backup is not None)
 
@@ -1603,11 +2218,22 @@ def _supervise_once() -> None:
                     {
                         "batch_id": clone_id,
                         "node_id": backup["node_id"],
+                        "backend": backup.get("backend"),
                         "status": "queued",
                         "queued_at": now,
                         "assigned_at": None,
                         "speculative_for": batch["batch_id"],
                         "speculated": False,
+                        # Sized for the backup machine, not the straggler.
+                        "device_memory_mb": backup.get("gpu_memory_mb", 0),
+                        "max_batch_size": _node_batch_ceiling(backup, run_for_batch.get("batch_size")),
+                        "unified_memory": bool((backup.get("capability") or {}).get("unified_memory")),
+                        "resolved_batch_size": None,
+                        "weights": None,
+                        "metrics": None,
+                        "error": None,
+                        "shard_bytes": 0,
+                        "weights_in_bytes": 0,
                     }
                 )
                 batches[clone_id] = clone
@@ -1635,6 +2261,10 @@ def _supervise_once() -> None:
                 ):
                     continue
                 nodes.pop(node_id, None)
+                try:
+                    store.put_node_stats({node_id: node})
+                except Exception:
+                    pass
                 emit(
                     "node.left",
                     {"node_id": node_id, "name": node.get("display_name"), "reason": "stopped responding"},
@@ -1884,6 +2514,7 @@ def remove_dataset(dataset_id: str, _: str = Depends(require_mesh_token)):
         )
     if in_use:
         raise HTTPException(status_code=409, detail="This dataset is in use by a running job")
+    _dirs_cache.clear()
     if not store.delete_dataset(dataset_id):
         raise HTTPException(status_code=404, detail="Unknown dataset")
     emit("dataset.removed", {"id": dataset_id})
@@ -1952,7 +2583,8 @@ def rotate_token(_: str = Depends(require_mesh_token)):
 def mesh_state(_: str = Depends(require_mesh_token)):
     """Everything the dashboard needs for a cold render, in one request."""
     policy = current_policy()
-    node_views = snapshot_nodes()
+    key = _preview_workload()
+    node_views = snapshot_nodes(key)
     decisions = admit([n for n in node_views], policy)
 
     for view in node_views:
@@ -1970,17 +2602,52 @@ def mesh_state(_: str = Depends(require_mesh_token)):
     dataset = store.default_dataset()
     preview = plan_round(node_views, int((dataset or {}).get("train_count") or 0), policy)
 
-    total_gflops = sum(float((n.get("capability") or {}).get("gflops") or 0.0) for n in node_views if n.get("active"))
-    total_memory = sum(int(n.get("gpu_memory_mb") or 0) for n in node_views if n.get("active"))
+    online = [n for n in node_views if n.get("active")]
+    total_gflops = sum(float((n.get("capability") or {}).get("gflops") or 0.0) for n in online)
+    total_memory = sum(int(n.get("gpu_memory_mb") or 0) for n in online)
+
+    # The hardware mix, by vendor. The cross-vendor paper asks this first.
+    backends: Dict[str, dict] = {}
+    for view in node_views:
+        backend = view.get("backend") or "cpu"
+        entry = backends.setdefault(
+            backend,
+            {
+                "backend": backend,
+                "vendor": VENDOR_OF.get(backend, "cpu"),
+                "nodes": 0,
+                "online": 0,
+                "eligible": 0,
+                "gflops": 0.0,
+                "memory_mb": 0,
+                "throughput_sps": 0.0,
+            },
+        )
+        entry["nodes"] += 1
+        if view.get("active"):
+            entry["online"] += 1
+            entry["gflops"] = round(entry["gflops"] + float((view.get("capability") or {}).get("gflops") or 0.0), 1)
+            entry["memory_mb"] += int(view.get("gpu_memory_mb") or 0)
+            entry["throughput_sps"] = round(entry["throughput_sps"] + float(view.get("throughput_sps") or 0.0), 2)
+        if view.get("tier") in {"full", "probation"}:
+            entry["eligible"] += 1
 
     return {
         "mesh_name": store.load().get("mesh_name", "GradMesh"),
+        "mesh_id": store.mesh_id(),
+        "version": __version__,
+        "protocol": PROTOCOL,
+        "reference_stack": REFERENCE_STACK,
+        "workload": key,
         "nodes": node_views,
+        "backends": sorted(backends.values(), key=lambda item: ("cuda", "xpu", "mps", "cpu").index(item["backend"])
+                           if item["backend"] in ("cuda", "xpu", "mps", "cpu") else 9),
         "metrics": {
             "nodes_total": len(node_views),
-            "nodes_active": sum(1 for n in node_views if n.get("active")),
+            "nodes_active": len(online),
             "nodes_training": sum(1 for n in node_views if n.get("active_batches", 0) > 0),
             "nodes_admitted": sum(1 for d in decisions.values() if d.tier != "rejected"),
+            "nodes_warned": sum(1 for n in online if n.get("warnings")),
             "total_gflops": round(total_gflops, 1),
             "total_memory_mb": total_memory,
             "active_shards": len(live_batches),
@@ -2298,7 +2965,27 @@ def _execute_suite(suite_id: str) -> None:
         benchmark.write_suite(directory, suite)
 
         ranked = _ranked_nodes()
-        if len(ranked) < spec.node_count:
+        if spec.backends:
+            # A vendor-mix trial uses every online machine of that mix. Its
+            # size is whatever is present, recorded in node_count, and a mix
+            # with a vendor missing is skipped rather than run as a smaller,
+            # differently composed mesh under the same label.
+            ranked = [node for node in ranked if node.get("backend") in set(spec.backends)]
+            present = {node.get("backend") for node in ranked}
+            missing = [backend for backend in spec.backends if backend not in present]
+            spec.node_count = len(ranked) if not missing else 0
+            if missing:
+                result = benchmark.trial_result(
+                    spec,
+                    {},
+                    benchmark.STATUS_SKIPPED,
+                    "no %s machine is online" % " or ".join(benchmark.VENDOR_NAMES.get(m, m) for m in missing),
+                )
+                suite.setdefault("results", []).append(result)
+                benchmark.write_suite(directory, suite)
+                emit("suite.trial", {"suite_id": suite_id, "trial": spec.as_dict(), "status": "skipped"})
+                continue
+        if len(ranked) < max(1, spec.node_count):
             result = benchmark.trial_result(
                 spec,
                 {},
@@ -2356,7 +3043,11 @@ def _execute_suite(suite_id: str) -> None:
                     imgsz=config.imgsz,
                     batch_size=config.batch_size,
                     mode="mesh",
+                    warmup_mode=config.warmup_mode,
                     warmup_epochs=config.warmup_epochs,
+                    optimizer=config.optimizer,
+                    worker_validation=config.worker_validation,
+                    backends=spec.backends,
                     node_ids=spec.node_ids,
                     partition_strategy=spec.strategy,
                     evaluate=config.evaluate,
@@ -2824,10 +3515,17 @@ def download_suite_artifact(suite_id: str, artifact: str, _: str = Depends(requi
 
 @app.get("/health")
 def health():
-    """Unauthenticated so the dev launcher can wait for readiness."""
+    """Unauthenticated: the launcher waits on it, and workers use it to find this mesh.
+
+    `mesh_id` is not a secret. It lets a worker that is looking for its
+    coordinator after an address change recognise the right one, rather than
+    joining whichever GradMesh it finds first.
+    """
     return {
         "status": "ok",
-        "version": "4.0.0",
+        "version": __version__,
+        "protocol": PROTOCOL,
+        "mesh_id": store.mesh_id(),
         "torch_ready": aggregation.torch_ready(),
         "nodes_active": sum(1 for node in nodes.values() if node.get("active")),
         "mdns": advertiser.as_dict(),

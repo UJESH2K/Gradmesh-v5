@@ -490,7 +490,9 @@
   width: 100%;
   border-radius: var(--radius);
   overflow: hidden;
-  background: radial-gradient(circle at 50% 45%, rgba(91, 124, 250, 0.1), transparent 70%);
+  background:
+    radial-gradient(circle at 50% 42%, rgba(109, 124, 255, 0.14), transparent 62%),
+    radial-gradient(circle at 50% 100%, rgba(34, 211, 238, 0.05), transparent 55%);
 }
 
 .rig-canvas {
@@ -498,15 +500,35 @@
   height: 100%;
 }
 
+.rig-canvas canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
 .rig-note {
   position: absolute;
   left: 10px;
   bottom: 8px;
-  font-size: 0.64rem;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
   color: var(--text-faint);
-  opacity: 0.6;
+  opacity: 0.55;
+  text-decoration: none;
+  transition: opacity 0.15s ease;
+}
+
+.rig-note:hover {
+  opacity: 1;
+  color: var(--text-muted, var(--text-faint));
+}
+
+@media (max-width: 760px) {
+  .train-hero {
+    grid-template-columns: 1fr;
+    padding: 16px;
+    gap: 16px;
+  }
 }
 
 .train-progress {

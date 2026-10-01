@@ -8,11 +8,12 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { hostname } from "node:os";
 import path from "node:path";
 import { NextResponse } from "next/server";
 
 import { currentUser } from "@/lib/auth";
-import { COORDINATOR_URL, STATE_DIR, meshToken, setupState } from "@/lib/config";
+import { COORDINATOR_URL, MACHINE, meshToken, setupState, venvPython } from "@/lib/config";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -37,8 +38,10 @@ export const runtime = "nodejs";
  * from a live ChildProcess object.
  */
 
-const LOG_PATH = () => path.join(STATE_DIR, "worker.log");
-const PID_PATH = () => path.join(STATE_DIR, "worker.pid");
+// Machine-local, not in the shared state directory: a pid synced from another
+// computer would make this one believe its worker was running.
+const LOG_PATH = () => MACHINE.workerLog;
+const PID_PATH = () => MACHINE.workerPid;
 const MAX_LOG_BYTES = 256 * 1024;
 
 function readPid(): number | null {
@@ -100,6 +103,9 @@ export async function GET() {
     pid: running ? pid : null,
     log: tailLog(),
     trainingPlane: setupState().trainingPlane,
+    accelerator: setupState().accelerator ?? null,
+    acceleratorProblem: setupState().acceleratorProblem ?? null,
+    backend: setupState().backend,
   });
 }
 
@@ -123,6 +129,19 @@ export async function POST() {
       { status: 409 }
     );
   }
+  if (setup.accelerator === "unavailable" || setup.backend === "cpu") {
+    // Starting it anyway would register a machine the scheduler can never use,
+    // which looks like a bug in the mesh rather than in this machine's driver.
+    return NextResponse.json(
+      {
+        detail:
+          setup.backend === "cpu"
+            ? "This machine has no GPU PyTorch can train on, so it can host the mesh but not contribute."
+            : `This machine's GPU cannot train yet: ${setup.acceleratorProblem || "the check failed"}. ${setup.fix || "Update the GPU driver and run npm run setup."}`,
+      },
+      { status: 409 }
+    );
+  }
 
   const token = meshToken();
   if (!token) {
@@ -130,23 +149,29 @@ export async function POST() {
   }
 
   const engineDir = path.join(process.cwd(), "engine");
-  const python =
-    process.platform === "win32"
-      ? path.join(process.cwd(), ".venv", "Scripts", "python.exe")
-      : path.join(process.cwd(), ".venv", "bin", "python");
+  const python = venvPython();
 
   if (!existsSync(python)) {
     return NextResponse.json({ detail: "No Python environment. Run `npm run setup`." }, { status: 409 });
   }
 
-  mkdirSync(STATE_DIR, { recursive: true });
+  mkdirSync(path.dirname(LOG_PATH()), { recursive: true });
   const logPath = LOG_PATH();
   writeFileSync(logPath, `# GradMesh worker started ${new Date().toISOString()}\n`);
   const logFd = openSync(logPath, "a");
 
   const child = spawn(
     python,
-    ["worker.py", "--server-url", COORDINATOR_URL, "--token", token, "--name", "this machine"],
+    [
+      "worker.py",
+      "--server-url",
+      COORDINATOR_URL,
+      "--token",
+      token,
+      "--name",
+      `${hostname()} (host)`,
+      ...(setup.backend && setup.backend !== "cpu" ? ["--backend", setup.backend] : []),
+    ],
     {
       cwd: engineDir,
       env: { ...process.env, PYTHONUNBUFFERED: "1" },

@@ -1,29 +1,33 @@
 # 3D models
 
-## `training-rig.glb`
+## `space-station.glb`
 
-Drop a GLB here with exactly this filename and the training screen picks it up
-on the next page load. No code change, no rebuild.
+The scene on the training screen, rendered by
+`components/dashboard/TrainingRig.tsx`: a figure standing in still water with
+planets orbiting overhead. Credits and licence are in [CREDITS.md](CREDITS.md);
+note that it is **non-commercial**.
 
-Until a file exists, `components/dashboard/TrainingRig.tsx` renders a procedural
-GPU fan instead, so the screen works either way.
+### How it moves
 
-### What the file should contain
+The file has no animation clips. The component animates the model's parts by
+node name:
 
-- **One object, authored around the origin.** It gets auto-scaled to about two
-  units and re-centred on load, so absolute size does not matter, but a model
-  built far from the origin will look off-centre.
-- **Baked animation clips that loop cleanly.** Every clip in the file is played
-  at once, so a robot arm with one clip per joint works with no configuration.
-  The first frame and the last frame should match, or the loop will visibly pop.
-- **Embedded textures.** External texture files are not resolved.
-- **Under about 5 MB.** It is loaded by every dashboard visitor.
+| Node | What happens |
+|---|---|
+| `body` | the figure; bobs gently |
+| `waves`, `waves1`, `waves2` | ripple rings; pulse outward, harder while aggregating |
+| `particles` | the star field; drifts around the vertical axis |
+| `Sphere*` | planets; each orbits the figure at its own radius, inner ones faster |
+| `Cube` | a black ground slab; hidden |
 
-### How it behaves
-
-Playback speed is driven by how much of the mesh is busy, so the rig runs faster
-under load and idles slowly when nothing is training. Its accent light changes
-colour with the run state: blue while training, cyan while aggregating weights,
+Speed follows how much of the mesh is training. The model's black material
+takes the run-state colour: indigo while training, cyan while aggregating,
 green when finished, red on failure.
 
-A model with no animation clips is slowly rotated instead.
+### Replacing it
+
+Drop another GLB at the same path. Anything works, but to get the motion keep
+those node names, or extend the name patterns at the top of `TrainingRig.tsx`.
+Keep it under about 5 MB (every dashboard visitor loads it) with embedded
+textures. If the file is missing or fails to load, a procedural scene with the
+same idea is drawn instead, so the screen never breaks.

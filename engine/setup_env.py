@@ -203,6 +203,8 @@ def ensure_venv(venv: Path, state: State) -> Path:
     if venv_python(venv).exists() or venv.exists():
         say("rebuilding the Python environment: %s" % problem, "yellow")
         state.note("Rebuilding the Python environment: %s." % problem)
+        # Whatever the record said was installed went with the old environment.
+        state.update(controlPlane="pending", trainingPlane="pending", accelerator=None)
         try:
             shutil.rmtree(venv)
         except Exception as exc:
@@ -479,24 +481,31 @@ def install(
     if plane in {"control", "all"}:
         requirements = requirements_dir / "requirements-control.txt"
         stamp = requirements_stamp(requirements)
-        state.update(controlPlane="installing", venv=str(venv), venvPython=str(python))
+        state.update(venv=str(venv), venvPython=str(python))
         if force or marker.get("control_stamp") != stamp:
+            state.update(controlPlane="installing")
             try:
                 pip_install(python, requirements, state, wheelhouse, quiet)
             except Exception as exc:
                 state.update(controlPlane="failed", controlError=str(exc))
                 raise
             _write_marker(venv, control_stamp=stamp)
-        state.update(controlPlane="ready")
-        state.note("Control plane ready.")
+            state.note("Control plane ready.")
+        state.update(controlPlane="ready", controlError=None)
 
     if plane in {"training", "all"}:
         facts = hardware.detect()
         profile = hardware.host_profile(facts, prefer) if host else hardware.select_profile_for(facts, prefer)
         result["profile"] = profile.as_dict()
         best = next((gpu for gpu in facts.gpus if gpu.name == profile.gpu_name), None)
+        requirements = requirements_dir / profile.requirements
+        stamp = requirements_stamp(requirements)
+        installed_profile = marker.get("training_profile")
+        needs_install = force or marker.get("training_stamp") != stamp or installed_profile != profile.name
         state.update(
-            trainingPlane="installing",
+            # Only claim "installing" when pip will actually run, so a launcher
+            # that re-checks on every start does not flash an install banner.
+            trainingPlane="installing" if needs_install else state.read().get("trainingPlane", "pending"),
             backend=profile.backend,
             profile=profile.name,
             profileLabel=profile.label,
@@ -518,12 +527,9 @@ def install(
         say("%s: %s" % (profile.gpu_name or "this machine", profile.reason))
         for warning in profile.warnings:
             say(warning, "yellow")
-        state.note("Installing %s." % profile.label)
 
-        requirements = requirements_dir / profile.requirements
-        stamp = requirements_stamp(requirements)
-        installed_profile = marker.get("training_profile")
-        if force or marker.get("training_stamp") != stamp or installed_profile != profile.name:
+        if needs_install:
+            state.note("Installing %s." % profile.label)
             if installed_profile and installed_profile != profile.name:
                 say("switching from %s to %s" % (installed_profile, profile.name), "yellow")
                 # Different PyTorch builds share a version number, so pip would
@@ -542,24 +548,42 @@ def install(
 
         say("checking that %s actually runs" % profile.backend)
         report = verify(python, profile.backend)
+        if report.get("error") and not needs_install:
+            # The record says this was installed, but torch will not import:
+            # a half-finished earlier install, or files removed underneath it.
+            # Reinstall once rather than reporting ready forever.
+            say("the installed PyTorch is damaged (%s); reinstalling" % report["error"], "yellow")
+            state.update(trainingPlane="installing")
+            subprocess.run([str(python), "-m", "pip", "uninstall", "-y", "torch", "torchvision"], capture_output=True)
+            try:
+                pip_install(python, requirements, state, wheelhouse, quiet)
+            except Exception as exc:
+                state.update(trainingPlane="failed", trainingError=str(exc))
+                raise
+            needs_install = True
+            report = verify(python, profile.backend)
         result["verify"] = report
         accelerator = "ok" if report["ok"] else "unavailable"
         state.update(
             trainingPlane="ready" if not report.get("error") else "failed",
+            trainingError=report.get("error"),
             torch=report.get("torch"),
             ultralytics=report.get("ultralytics"),
             verify=report,
             accelerator=accelerator,
             acceleratorProblem=report.get("problem"),
+            verifiedAt=int(time.time() * 1000),
         )
         if report["ok"]:
             say("%s ready: torch %s on %s" % (profile.label, report.get("torch"), report.get("device", "CPU")), "green")
-            state.note("Training plane ready. Runs can start now.")
+            if needs_install:
+                state.note("Training plane ready. Runs can start now.")
         else:
             say(report["problem"], "red")
             if profile.fix:
                 say(profile.fix, "yellow")
-            state.note("Training plane installed, but the accelerator check failed.")
+            if needs_install:
+                state.note("Training plane installed, but the accelerator check failed.")
     return result
 
 
