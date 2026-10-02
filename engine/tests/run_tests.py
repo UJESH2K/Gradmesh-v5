@@ -185,6 +185,123 @@ def an_intel_mac_is_blocked():
 
 
 @test
+def an_intel_python_under_rosetta_on_an_m1_is_told_to_use_a_native_python():
+    facts = mac("14.5", arch="x86_64")
+    facts.translated = True
+    facts.gpus = [Gpu(vendor="apple", name="Apple M1, 8-core GPU")]
+    profile = hardware.select_profile(facts)
+    assert profile.blocked and "Rosetta" in profile.blocked, profile
+    assert "/opt/homebrew" in (profile.fix or ""), profile.fix
+    assert "Intel Macs" not in profile.reason, profile.reason
+
+
+@test
+def an_8gb_m1_air_gets_the_mps_build_with_a_unified_memory_note():
+    facts = mac("15.2")
+    facts.ram_mb = 8192
+    facts.gpus = [Gpu(vendor="apple", name="Apple M1, 8-core GPU", memory_mb=8192, cores=8)]
+    profile = hardware.select_profile(facts)
+    assert profile.name == "mps" and not profile.blocked and profile.reference, profile
+    assert profile.gpu_name == "Apple M1, 8-core GPU", profile.gpu_name
+    assert any("unified memory" in warning for warning in profile.warnings), profile.warnings
+
+
+@test
+def a_16gb_mac_gets_no_memory_note():
+    facts = mac("14.5")
+    facts.ram_mb = 16384
+    assert not hardware.select_profile(facts).warnings
+
+
+@test
+def apple_gpu_names_carry_the_core_count_when_macos_reports_it():
+    assert hardware.apple_gpu_name("Apple M1", 7) == "Apple M1, 7-core GPU"
+    assert hardware.apple_gpu_name("Apple M1", None) == "Apple M1"
+
+
+@test
+def system_profiler_output_for_an_m1_becomes_a_named_unified_memory_gpu():
+    sample = json.dumps({"SPDisplaysDataType": [{
+        "_name": "Apple M1", "sppci_model": "Apple M1", "sppci_cores": "7",
+        "spdisplays_vendor": "sppci_vendor_Apple",
+    }]})
+    original = hardware._run
+    hardware._run = lambda command, timeout=8.0: sample if command[0] == "system_profiler" else None
+    try:
+        gpus = hardware._apple_gpus(8192)
+    finally:
+        hardware._run = original
+    assert len(gpus) == 1 and gpus[0].vendor == "apple", gpus
+    assert gpus[0].name == "Apple M1, 7-core GPU" and gpus[0].cores == 7 and gpus[0].memory_mb == 8192, gpus[0]
+
+
+@test
+def an_8gb_mac_caps_metal_memory_and_a_16gb_mac_does_not():
+    import types
+
+    import worker
+
+    keys = ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "PYTORCH_MPS_LOW_WATERMARK_RATIO")
+    saved_env = {key: os.environ.pop(key, None) for key in keys}
+    saved_platform, saved_run = worker.sys.platform, worker.subprocess.run
+    try:
+        worker.sys.platform = "darwin"
+        worker.subprocess.run = lambda *a, **k: types.SimpleNamespace(stdout=str(8 * 2**30), returncode=0)
+        assert worker.cap_metal_memory(), "no note for an 8 GB Mac"
+        assert os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "1.0"
+        assert float(os.environ["PYTORCH_MPS_LOW_WATERMARK_RATIO"]) <= 1.0
+        for key in keys:
+            os.environ.pop(key, None)
+        worker.subprocess.run = lambda *a, **k: types.SimpleNamespace(stdout=str(16 * 2**30), returncode=0)
+        assert worker.cap_metal_memory() is None and keys[0] not in os.environ
+        # A value the person set is never overridden.
+        os.environ[keys[0]] = "0.0"
+        worker.subprocess.run = lambda *a, **k: types.SimpleNamespace(stdout=str(8 * 2**30), returncode=0)
+        assert worker.cap_metal_memory() is None and os.environ[keys[0]] == "0.0"
+    finally:
+        worker.sys.platform, worker.subprocess.run = saved_platform, saved_run
+        for key, value in saved_env.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+
+@test
+def setup_restarts_itself_as_arm64_when_it_starts_under_rosetta():
+    import setup_env
+
+    calls = []
+    saved = (setup_env.sys.platform, setup_env.hardware.under_rosetta, setup_env.os.path.exists,
+             setup_env._runs_natively, setup_env.os.execv, os.environ.pop("GRADMESH_NATIVE_RELAUNCH", None))
+    try:
+        setup_env.sys.platform = "darwin"
+        setup_env.hardware.under_rosetta = lambda: True
+        setup_env.os.path.exists = lambda path: True
+        setup_env._runs_natively = lambda python: python == "/opt/homebrew/bin/python3.12"
+        setup_env.os.execv = lambda path, argv: calls.append((path, argv))
+        setup_env.relaunch_natively_if_translated(["agent", "--server", "http://h:8000", "--token", "t"])
+    finally:
+        (setup_env.sys.platform, setup_env.hardware.under_rosetta, setup_env.os.path.exists,
+         setup_env._runs_natively, setup_env.os.execv) = saved[:5]
+        os.environ.pop("GRADMESH_NATIVE_RELAUNCH", None)
+        if saved[5] is not None:
+            os.environ["GRADMESH_NATIVE_RELAUNCH"] = saved[5]
+    assert calls, "did not relaunch"
+    path, argv = calls[0]
+    assert path == "/usr/bin/arch" and argv[:3] == ["/usr/bin/arch", "-arm64", "/opt/homebrew/bin/python3.12"], argv
+    assert argv[3].endswith("setup_env.py") and argv[4:] == ["agent", "--server", "http://h:8000", "--token", "t"], argv
+
+
+@test
+def host_facts_round_trip_with_the_new_fields():
+    facts = mac("14.5")
+    facts.translated = True
+    facts.gpus[0].cores = 8
+    again = HostFacts.from_dict(json.loads(json.dumps(facts.as_dict())))
+    assert again.translated and again.gpus[0].cores == 8, again
+
+
+@test
 def an_amd_only_machine_gets_cpu_with_a_reason():
     profile = hardware.select_profile(linux(Gpu(vendor="amd", name="AMD Radeon RX 7900 XTX")))
     assert profile.backend == "cpu" and "AMD" in profile.reason, profile
@@ -234,6 +351,59 @@ def the_join_flow_ships_every_file_the_agent_imports():
         needed.add(path.name)
     missing = needed - listed
     assert not missing, missing
+
+
+# ---------------------------------------------------------------------------
+# Machine health and software
+# ---------------------------------------------------------------------------
+
+
+@test
+def a_hot_mac_in_low_power_mode_is_explained():
+    from coordinator.health import health_warnings
+
+    warnings = health_warnings({"thermal_state": "serious", "low_power_mode": True})
+    assert any("thermal" in warning for warning in warnings), warnings
+    assert any("Low Power Mode" in warning for warning in warnings), warnings
+    assert not health_warnings({"thermal_state": "fair", "low_power_mode": False})
+
+
+@test
+def swap_on_an_8gb_machine_and_a_full_disk_are_flagged():
+    from coordinator.health import health_warnings
+
+    warnings = health_warnings({"swap_used_mb": 3072, "ram_mb": 8192, "disk_free_mb": 2048})
+    assert any("swap" in warning for warning in warnings), warnings
+    assert any("free on disk" in warning for warning in warnings), warnings
+    # The same swap on a 32 GB workstation is not worth a warning.
+    assert not health_warnings({"swap_used_mb": 3072, "ram_mb": 32768, "disk_free_mb": 200000})
+
+
+@test
+def software_view_marks_machines_on_and_off_the_reference_stack():
+    from coordinator.software import software_view
+
+    on = software_view(
+        {"backend": "cuda", "torch_version": "2.13.0+cu130", "torchvision_version": "0.28.0+cu130",
+         "ultralytics_version": REFERENCE_STACK["ultralytics"], "python_version": "3.12.10", "runtime": "CUDA 13.0",
+         "os_version": "Windows 11 (build 26200)"},
+        {"driver": "581.80"}, "5.0.0", REFERENCE_STACK, "5.0.0",
+    )
+    assert on["on_reference"] is True and on["torch_build"] == "cu130" and on["driver"] == "581.80", on
+    assert not on["agent_behind"], on
+
+    off = software_view(
+        {"backend": "cuda", "torch_version": "2.11.0+cu128", "ultralytics_version": REFERENCE_STACK["ultralytics"]},
+        {}, "4.9.0", REFERENCE_STACK, "5.0.0",
+    )
+    assert off["on_reference"] is False and any("torch 2.11.0" in item for item in off["drift"]), off
+    assert off["agent_behind"], off
+
+    mac_view = software_view({"backend": "mps", "torch_version": "2.13.0"}, {}, "5.0.0", REFERENCE_STACK, "5.0.0")
+    assert mac_view["torch_build"] == "macOS" and mac_view["on_reference"] is True, mac_view
+
+    unknown = software_view({}, {}, "", REFERENCE_STACK, "5.0.0")
+    assert unknown["on_reference"] is None, unknown
 
 
 # ---------------------------------------------------------------------------

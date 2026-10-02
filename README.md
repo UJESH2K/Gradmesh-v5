@@ -88,9 +88,13 @@ What each kind of machine needs first:
 |---|---|
 | NVIDIA | GTX 900 or newer, Windows or Linux, NVIDIA driver 580+ (RTX 50 series: at least 570) |
 | Intel | Arc A/B series or Core Ultra with Arc Graphics, Windows or Linux, current Intel graphics driver |
-| Apple | Apple Silicon (M1 or later), macOS 14 Sonoma or newer |
+| Apple | Apple Silicon (M1 or later), macOS 14 Sonoma or newer, an arm64 Python (Homebrew's) |
 
-The **Setup and health** page in the dashboard shows the same, live.
+The **Setup and health** page in the dashboard shows the same, live, and every
+machine's card shows the software it trains with (Python, PyTorch build,
+torchvision, Ultralytics, runtime, OS, agent) and whether that matches the
+reference stack. The Apple test machine, an 8 GB MacBook Air M1, has its own
+page: **[docs/MAC-M1.md](docs/MAC-M1.md)**.
 
 ---
 
@@ -257,6 +261,6 @@ GradMesh is designed for a network you can see.
 
 ## Credits
 
-The training screen's scene is "space boi" by silvercrow101, licensed
+The 3D scene on the landing page and the training screen is "space boi" by silvercrow101, licensed
 CC BY-NC 4.0; see [public/models/CREDITS.md](public/models/CREDITS.md). It is
 non-commercial: replace it before any commercial use.

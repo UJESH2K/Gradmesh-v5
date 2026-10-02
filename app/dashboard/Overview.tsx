@@ -4,11 +4,13 @@ import Link from "next/link";
 
 import EventFeed from "@/components/dashboard/EventFeed";
 import HardwareMix from "@/components/dashboard/HardwareMix";
+import { nodeSoftware } from "@/components/dashboard/SoftwareStack";
 import NodeCard from "@/components/dashboard/NodeCard";
 import { VendorDot } from "@/components/dashboard/VendorBadge";
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import { Empty, Meter, Panel, StatTile, StatusBadge } from "@/components/dashboard/ui";
 import { compact, gflops, memory, seconds } from "@/lib/format";
+import type { MeshState } from "@/lib/types";
 
 export default function Overview({ canManage }: { canManage: boolean }) {
   const { mesh, request, refresh } = useMesh();
@@ -71,6 +73,7 @@ export default function Overview({ canManage }: { canManage: boolean }) {
         }
       >
         <HardwareMix backends={mesh.backends} />
+        <StackSummary mesh={mesh} />
       </Panel>
 
       {activeRuns.length > 0 ? (
@@ -213,5 +216,29 @@ export default function Overview({ canManage }: { canManage: boolean }) {
         </Panel>
       </div>
     </>
+  );
+}
+
+/** One line under the hardware mix: is every online machine on the pinned stack? */
+function StackSummary({ mesh }: { mesh: MeshState }) {
+  const online = mesh.nodes.filter((node) => node.active);
+  if (online.length === 0 || !mesh.reference_stack) return null;
+  const stacks = online.map((node) => ({ node, software: nodeSoftware(node) }));
+  const off = stacks.filter((item) => item.software.on_reference === false);
+  const unknown = stacks.filter((item) => item.software.on_reference === null);
+  const reference = mesh.reference_stack;
+  return (
+    <p className="small" style={{ marginTop: 14, color: off.length ? "var(--warn)" : "var(--text-dim)" }}>
+      <span className="faint">Software · </span>
+      {off.length === 0 && unknown.length === 0
+        ? `all ${online.length} online machine${online.length === 1 ? "" : "s"} on the reference stack`
+        : `${online.length - off.length - unknown.length} of ${online.length} on the reference stack`}
+      <span className="mono faint">
+        {" "}
+        (torch {reference.torch} · torchvision {reference.torchvision} · ultralytics {reference.ultralytics})
+      </span>
+      {off.length > 0 ? `. Off it: ${off.map((item) => `${item.node.display_name} (${item.software.drift.join(", ")})`).join("; ")}` : ""}
+      {unknown.length > 0 ? `. Not reported: ${unknown.map((item) => item.node.display_name).join(", ")}` : ""}
+    </p>
   );
 }

@@ -64,6 +64,7 @@ class Accelerator:
     # grants rather than a physical card, and batch sizing has to treat it so.
     unified_memory: bool = False
     allow_cpu_training: bool = False
+    gpu_cores: Optional[int] = None
 
     @property
     def vendor(self) -> str:
@@ -193,10 +194,27 @@ def _mps_accelerator() -> Accelerator:
         budget = 0
     if budget <= 0:
         budget = int(_system_memory_mb() * 0.65)
-    chip = "Apple GPU"
-    try:
-        import subprocess
+    chip, cores = _apple_chip()
+    return Accelerator(
+        backend="mps",
+        torch_device=torch.device("mps"),
+        # "Apple M1, 8-core GPU": the M1 Air came with 7 or 8 GPU cores, and
+        # the paper's hardware table needs to say which.
+        device_name="%s, %d-core GPU" % (chip, cores) if cores else chip,
+        total_memory_mb=budget,
+        ultralytics_device="mps",
+        unified_memory=True,
+        gpu_cores=cores,
+    )
 
+
+def _apple_chip() -> tuple:
+    """('Apple M1', 8): the chip name and its GPU core count, where macOS says."""
+    import json
+    import subprocess
+
+    chip, cores = "Apple GPU", None
+    try:
         chip = (
             subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, timeout=3
@@ -205,14 +223,18 @@ def _mps_accelerator() -> Accelerator:
         )
     except Exception:
         pass
-    return Accelerator(
-        backend="mps",
-        torch_device=torch.device("mps"),
-        device_name="%s (Metal)" % chip,
-        total_memory_mb=budget,
-        ultralytics_device="mps",
-        unified_memory=True,
-    )
+    try:
+        raw = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"], capture_output=True, text=True, timeout=15
+        ).stdout
+        for entry in json.loads(raw).get("SPDisplaysDataType", []):
+            if "apple" in str(entry.get("sppci_model", "")).lower():
+                chip = entry.get("sppci_model") or chip
+                cores = int(str(entry.get("sppci_cores") or "0")) or None
+                break
+    except Exception:
+        pass
+    return chip, cores
 
 
 def _cpu_accelerator(advertised_memory_mb: Optional[int], allow_training: bool) -> Accelerator:

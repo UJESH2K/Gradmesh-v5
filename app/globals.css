@@ -453,6 +453,119 @@ hr {
   font-size: 0.79rem;
 }
 
+/* A command to paste elsewhere: one line that scrolls sideways rather than
+   wrapping, so the copy button never lands on top of the text. */
+.copy-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 7px 7px 7px 13px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.copy-line code {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  color: var(--text);
+  scrollbar-width: none;
+}
+
+.copy-line code::-webkit-scrollbar {
+  display: none;
+}
+
+.copy-line .btn {
+  flex: none;
+}
+
+/* Label and value pairs: machine cards, and the join page's device summary. */
+.node-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 16px;
+  font-size: 0.81rem;
+}
+
+.node-fact {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.node-fact {
+  min-width: 0;
+}
+
+.node-fact span:first-child {
+  flex: none;
+  color: var(--text-faint);
+}
+
+.node-fact span:last-child {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A machine's software stack, on its card. */
+.sw-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.sw-title {
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  font-weight: 560;
+}
+
+.sw-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 14px;
+  margin: 0;
+}
+
+.sw-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.sw-grid dt {
+  font-size: 0.68rem;
+  color: var(--text-faint);
+}
+
+.sw-grid dd {
+  margin: 0;
+  font-size: 0.76rem;
+  color: var(--text-dim);
+}
+
+.sw-grid > div.is-behind dd {
+  color: var(--warn);
+}
+
+.sw-drift {
+  color: var(--warn);
+}
+
 /* ------------------------------------------------------------------ forms */
 
 .field {

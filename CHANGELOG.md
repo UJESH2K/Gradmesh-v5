@@ -1,5 +1,55 @@
 # Changelog
 
+## 5.1.0
+
+Ready for the Apple test machine, an 8 GB MacBook Air M1. The software each
+machine runs is shown on the dashboard. The landing page is rebuilt around the
+3D scene.
+
+### Apple Silicon, and an 8 GB M1 in particular
+
+- An Intel Python under Rosetta no longer makes an M1 look like an Intel Mac.
+  `hardware.detect()` tells the two apart (`translated`). The join script tries
+  `/opt/homebrew` first and runs every candidate as `arch -arm64`. If setup
+  starts under Rosetta anyway, it restarts itself natively, and if no native
+  Python exists it stops with the exact fix.
+- On Macs with 8 GB or less, the worker caps Metal allocations at the
+  recommended working set (`PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0`), so an
+  oversized batch fails cleanly and is halved instead of swapping to the SSD.
+- Apple GPUs report their core count (`Apple M1, 8-core GPU`), and a Metal
+  out-of-memory error says that the memory is shared with macOS and open apps.
+- New diagnostics: macOS thermal state and Low Power Mode, read through
+  Foundation without extra packages, plus swap in use and free disk, each with
+  a dashboard warning.
+- `docs/MAC-M1.md`: the machine, what GradMesh does for it, the checklist for
+  the day before and the day itself, expected batch sizes, troubleshooting,
+  and a session log.
+
+### Software on the dashboard
+
+- Workers report Python, torchvision, Ultralytics, the runtime (CUDA version,
+  Intel XPU, Metal) and a readable OS name next to the torch build.
+- The coordinator compares each machine with the reference stack
+  (`coordinator/software.py`).
+- Each machine card has a Software block with a *reference stack* / *off
+  reference* badge. The Machines page has a table of every machine's stack,
+  the sidebar shows the GradMesh version and the pinned stack, and the Setup
+  page names exactly what drifted.
+
+### Landing page
+
+- Rebuilt around the space scene: a fixed WebGL backdrop that turns on its own
+  while the model moves to whichever side each section leaves free. Planets
+  orbit, ripples spread, and the rings take the vendor colours.
+- Sections cover the three vendors, the scheduler's equation with an animated
+  v4-vs-v5 timeline, the measured anatomy of a round, the join commands and
+  the trust model. Live mesh status comes from `/api/health`.
+- Mobile layout: the scene sits smaller and dimmer behind the text. Rendering
+  is capped at 1.5x pixels, pauses in background tabs and respects reduced
+  motion.
+- The copy-command field gets real styles; it had none, so the copy button
+  could overlap long commands.
+
 ## 5.0.0
 
 The baseline for the cross-vendor paper: NVIDIA, Intel and Apple GPUs in one

@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useRef } from "react";
 import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
 
 import CopyLine from "./CopyLine";
 import Logo from "./Logo";
-import LiveBackground from "./LiveBackground";
-import MeshCanvas from "./MeshCanvas";
+import SpaceBackdrop from "./SpaceBackdrop";
+import { CREDIT_URL } from "./three/station";
 
 type Props = {
   origin: string;
@@ -15,110 +15,129 @@ type Props = {
   meshName: string;
 };
 
-const FEATURES = [
+type Health = { coordinator?: string; lan?: string; setup?: { torch?: string; backend?: string } };
+
+const VENDORS = [
   {
-    title: "Measured, not trusted",
-    body: "Every machine runs a throughput probe before it can hold a shard. The coordinator ranks devices on what they actually deliver, not on a name string.",
+    key: "nvidia",
+    name: "NVIDIA",
+    api: "CUDA",
+    spec: "GTX 900 → RTX 50",
+    detail: "Build chosen from compute capability and driver: CUDA 13.0 from Turing on, 12.6 for older cards.",
+    code: "sm_50 … sm_120",
   },
   {
-    title: "Shards sized to the device",
-    body: "A round costs whatever the slowest worker costs. Each machine's fixed overhead and per-image speed are learned from its own rounds, shards are sized so every worker finishes at the same instant, and updates are averaged in proportion to the data behind them.",
+    key: "intel",
+    name: "Intel",
+    api: "XPU",
+    spec: "Arc A · Arc B · Core Ultra",
+    detail: "PyTorch XPU with the validated Arc trainer. AMP off, foreach off, verified with a kernel launch.",
+    code: "level zero",
   },
   {
-    title: "Stragglers do not stall rounds",
-    body: "Each shard carries a deadline derived from its own prediction. A soft miss clones the work onto an idle peer. A hard miss releases the barrier without it.",
-  },
-  {
-    title: "NVIDIA, Intel and Apple together",
-    body: "CUDA, Intel XPU and Apple Metal machines join the same mesh on one pinned PyTorch stack. Weights from all three average into one model, and every result is broken down by vendor.",
-  },
-  {
-    title: "One line to contribute",
-    body: "A contributor pastes a single command. It finds their accelerator, installs the right PyTorch build, proves the GPU runs, and joins. No repository to clone, no requirements to read.",
-  },
-  {
-    title: "Your data stays on your network",
-    body: "Shards, checkpoints and gradients move over your LAN between machines you can see. Nothing leaves for a third-party cluster.",
+    key: "apple",
+    name: "Apple",
+    api: "Metal",
+    spec: "M1 and later · macOS 14+",
+    detail: "MPS on unified memory, with batch sizes budgeted against what Metal will actually grant.",
+    code: "mps · unified",
   },
 ];
 
-const STEPS = [
-  { title: "Start the mesh", body: "Run one command on the machine holding your dataset. The coordinator and the dashboard come up together." },
-  { title: "Share the link", body: "Anyone on the same Wi-Fi opens the join page and pastes one line. Their GPU appears in the dashboard within seconds." },
-  { title: "Upload a dataset", body: "Drop in a YOLO export. It becomes the mesh default, and every machine that joins later trains against it." },
-  { title: "Watch it train", body: "Live shard timings, per-device throughput, straggler decisions and speedup, streamed as they happen." },
+/** Two identical GPUs, one with heavier per-round overhead (seconds). */
+const SCHEDULE = {
+  linear: [
+    { name: "node a", fixed: 19, work: 21, total: 40 },
+    { name: "node b", fixed: 30, work: 21, total: 51 },
+  ],
+  affine: [
+    { name: "node a", fixed: 19, work: 26, total: 45 },
+    { name: "node b", fixed: 30, work: 15, total: 45 },
+  ],
+};
+
+const PHASES = [
+  { name: "fetch", value: "0.07 s", note: "images come from the worker's cache; only weights move", width: 6 },
+  { name: "load", value: "0.30 s", note: "checkpoint plus the global fp32 weights", width: 9 },
+  { name: "setup", value: "0.26 s", note: "trainer and loaders; no AMP download", width: 8 },
+  { name: "train", value: "1.04 s", note: "the only part that scales with the shard", width: 52 },
+  { name: "post", value: "0.35 s", note: "no per-worker validation", width: 10 },
+  { name: "aggregate", value: "0.15 s", note: "streamed FedAvg on the host", width: 15 },
 ];
+
+function useHealth(): Health | null {
+  const [health, setHealth] = useState<Health | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () =>
+      fetch("/api/health", { cache: "no-store" })
+        .then((response) => (response.ok ? response.json() : null))
+        .then((payload) => alive && setHealth(payload))
+        .catch(() => alive && setHealth(null));
+    void load();
+    const timer = setInterval(load, 15000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, []);
+  return health;
+}
 
 export default function Landing({ origin, signedIn, needsFirstAccount, meshName }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const health = useHealth();
+  const [platform, setPlatform] = useState<"windows" | "unix">("windows");
+
+  useEffect(() => {
+    if (/Mac|Linux/i.test(navigator.platform || navigator.userAgent)) setPlatform("unix");
+  }, []);
 
   useEffect(() => {
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-
     let cleanup = () => {};
     let cancelled = false;
 
     (async () => {
-      const [{ gsap }, { ScrollTrigger }] = await Promise.all([
-        import("gsap"),
-        import("gsap/ScrollTrigger"),
-      ]);
+      const [{ gsap }, { ScrollTrigger }] = await Promise.all([import("gsap"), import("gsap/ScrollTrigger")]);
       if (cancelled) return;
-
       gsap.registerPlugin(ScrollTrigger);
-
       const context = gsap.context(() => {
-        // Hero: staggered entrance, no scroll trigger, it is above the fold.
-        gsap.from("[data-hero]", {
-          y: 26,
-          opacity: 0,
-          duration: 0.85,
-          ease: "power3.out",
-          stagger: 0.09,
-        });
-
-        // Everything below reveals as it enters the viewport.
-        gsap.utils.toArray<HTMLElement>(".js-reveal").forEach((element) => {
+        gsap.from("[data-hero]", { y: 28, opacity: 0, duration: 1, ease: "power3.out", stagger: 0.08, delay: 0.15 });
+        gsap.from(".ld-annotation", { opacity: 0, x: 18, duration: 0.9, ease: "power2.out", stagger: 0.18, delay: 0.9 });
+        gsap.utils.toArray<HTMLElement>("[data-reveal]").forEach((element) => {
           gsap.from(element, {
-            y: 30,
+            y: 34,
+            opacity: 0,
+            duration: 0.85,
+            ease: "power3.out",
+            scrollTrigger: { trigger: element, start: "top 85%", once: true },
+          });
+        });
+        gsap.utils.toArray<HTMLElement>("[data-cascade]").forEach((group) => {
+          gsap.from(group.children, {
+            y: 26,
             opacity: 0,
             duration: 0.7,
-            ease: "power2.out",
-            scrollTrigger: { trigger: element, start: "top 86%", once: true },
+            ease: "power3.out",
+            stagger: 0.09,
+            scrollTrigger: { trigger: group, start: "top 82%", once: true },
           });
         });
-
-        gsap.utils.toArray<HTMLElement>("[data-stagger]").forEach((group) => {
-          gsap.from(group.children, {
-            y: 24,
-            opacity: 0,
-            duration: 0.6,
-            ease: "power2.out",
-            stagger: 0.07,
-            scrollTrigger: { trigger: group, start: "top 84%", once: true },
-          });
-        });
-
-        // The two schedules animate their bars, so the difference between an
-        // even split and a proportional one is something you watch happen.
-        gsap.utils.toArray<HTMLElement>("[data-bar]").forEach((bar) => {
+        gsap.utils.toArray<HTMLElement>("[data-grow]").forEach((bar) => {
           gsap.from(bar, {
             scaleX: 0,
-            duration: 1.05,
+            transformOrigin: "left center",
+            duration: 1.1,
             ease: "power2.inOut",
-            scrollTrigger: { trigger: bar.closest(".split-demo"), start: "top 74%", once: true },
+            scrollTrigger: { trigger: bar.closest("[data-grow-root]") ?? bar, start: "top 75%", once: true },
           });
         });
-
-        // Nav gains a hairline once the hero scrolls away.
         ScrollTrigger.create({
-          start: 64,
-          onUpdate: (self) => {
-            document.querySelector(".nav")?.classList.toggle("is-stuck", self.scroll() > 64);
-          },
+          start: 40,
+          onUpdate: (self) => document.querySelector(".ld-nav")?.classList.toggle("is-stuck", self.scroll() > 40),
         });
       }, rootRef);
-
       cleanup = () => context.revert();
     })();
 
@@ -129,294 +148,382 @@ export default function Landing({ origin, signedIn, needsFirstAccount, meshName 
   }, []);
 
   const dashboardHref = signedIn ? "/dashboard" : needsFirstAccount ? "/login?first=1" : "/login";
+  const primaryLabel = signedIn ? "Open the dashboard" : needsFirstAccount ? "Claim this mesh" : "Sign in";
   const windowsCommand = `irm ${origin}/join.ps1 | iex`;
+  const unixCommand = `curl -fsSL ${origin}/join.sh | sh`;
+  const online = health?.coordinator === "up";
+  let host = origin;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    host = origin;
+  }
 
   return (
-    <div ref={rootRef}>
-      <header className="nav">
-        <div className="container nav-inner">
-          <Link href="/" className="brand">
+    <div ref={rootRef} className="ld">
+      <SpaceBackdrop />
+
+      <header className="ld-nav">
+        <div className="ld-container ld-nav-inner">
+          <Link href="/" className="ld-brand">
             <Logo />
             <span>{meshName}</span>
+            <span className="ld-version">v5</span>
           </Link>
-          <nav className="nav-links">
-            <a href="#how">How it works</a>
+          <nav className="ld-links">
+            <a href="#vendors">Hardware</a>
             <a href="#scheduler">Scheduler</a>
-            <a href="#trust">Trust</a>
-            <Link href="/join">Contribute a GPU</Link>
+            <a href="#round">A round</a>
+            <a href="#join">Join</a>
           </nav>
-          <div className="row" style={{ gap: 8 }}>
-            <Link className="btn btn-sm" href="/join">
+          <div className="ld-nav-actions">
+            <Link className="ld-btn ld-btn-ghost" href="/join">
               Lend a GPU
             </Link>
-            <Link className="btn btn-primary btn-sm" href={dashboardHref}>
-              {signedIn ? "Open dashboard" : needsFirstAccount ? "Claim this mesh" : "Sign in"}
+            <Link className="ld-btn ld-btn-solid" href={dashboardHref}>
+              {signedIn ? "Dashboard" : primaryLabel}
             </Link>
           </div>
         </div>
       </header>
 
-      <section className="hero">
-        <LiveBackground />
-        <MeshCanvas />
-        <div className="container hero-inner">
-          <span className="hero-tag" data-hero>
-            <span className="dot dot-live" />
-            Running on this machine right now
-          </span>
-
-          <h1 data-hero>
-            Every GPU on your network,
-            <br />
-            <span className="glow">one training cluster.</span>
-          </h1>
-
-          <p className="hero-sub" data-hero>
-            The compute you need is already in the room. GradMesh finds the idle GPUs on your
-            network, NVIDIA, Intel Arc and Apple Silicon alike, measures what each one can actually
-            do, and trains a single model across all of them. One command to start. One line for
-            anyone else to join.
-          </p>
-
-          <div className="hero-actions" data-hero>
-            <Link className="btn btn-primary btn-lg" href={dashboardHref}>
-              {signedIn ? "Open the dashboard" : "Open the dashboard"}
-            </Link>
-            <Link className="btn btn-lg" href="/join">
-              Contribute this machine
-            </Link>
-          </div>
-
-          <div className="hero-command" data-hero>
-            <CopyLine value={windowsCommand} label="Anyone on this network can join with one line" />
-          </div>
-        </div>
-      </section>
-
-      <div className="container">
-        <div className="rule" />
-      </div>
-
-      <section className="section" id="problem">
-        <div className="container">
-          <div className="section-head js-reveal">
-            <span className="eyebrow">The problem</span>
-            <h2>Distributed training punishes you for having mixed hardware.</h2>
-            <p>
-              Split a dataset evenly across a fast card and a slow one and every round costs what the
-              slow one costs. Add a third, weaker machine and the mesh gets slower, not faster. That
-              is why lending a friend&apos;s GPU has never actually been worth the setup.
-            </p>
-          </div>
-
-          <div className="split-demo">
-            <div className="split-card js-reveal">
-              <div className="split-title">
-                <div>
-                  <div className="panel-title">Even split</div>
-                  <div className="small faint">Every worker gets a third of the data</div>
-                </div>
-                <span className="badge badge-danger">42s round</span>
+      <main>
+        {/* hero ------------------------------------------------------------ */}
+        <section className="ld-hero" data-scene-x="0.6" data-scene-y="-0.05" data-scene-zoom="1" data-scene-dim="0">
+          <div className="ld-container ld-hero-grid">
+            <div className="ld-hero-copy">
+              <div className="ld-hud" data-hero>
+                <span className={`ld-pulse${online ? " is-on" : ""}`} />
+                <span>{online ? "mesh online" : "mesh offline"}</span>
+                <span className="ld-hud-sep">/</span>
+                <span>{host}</span>
+                <span className="ld-hud-sep">/</span>
+                <span>torch 2.13.0</span>
               </div>
-              <Gantt
-                rows={[
-                  { name: "RTX 3060", work: 26, idle: 74, label: "11s" },
-                  { name: "Arc A370M", work: 55, idle: 45, label: "23s" },
-                  { name: "GTX 1650", work: 100, idle: 0, label: "42s" },
-                ]}
-              />
-              <p className="small faint" style={{ marginTop: 16 }}>
-                Two machines sit idle for most of the round waiting on the third.
+
+              <h1 className="ld-title" data-hero>
+                Every GPU in the room.
+                <span className="ld-title-glow">One model.</span>
+              </h1>
+
+              <p className="ld-lede" data-hero>
+                GradMesh turns the NVIDIA, Intel and Apple machines already on your network into a single training
+                cluster. It measures what each one really delivers, sizes the work so they all finish together, and
+                averages their updates into one model.
               </p>
+
+              <div className="ld-actions" data-hero>
+                <Link className="ld-btn ld-btn-solid ld-btn-lg" href={dashboardHref}>
+                  {primaryLabel}
+                  <span aria-hidden="true">→</span>
+                </Link>
+                <Link className="ld-btn ld-btn-ghost ld-btn-lg" href="/join">
+                  Contribute this machine
+                </Link>
+              </div>
+
+              <div className="ld-command" data-hero>
+                <div className="ld-tabs" role="tablist">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={platform === "windows"}
+                    className={platform === "windows" ? "is-on" : ""}
+                    onClick={() => setPlatform("windows")}
+                  >
+                    Windows
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={platform === "unix"}
+                    className={platform === "unix" ? "is-on" : ""}
+                    onClick={() => setPlatform("unix")}
+                  >
+                    macOS · Linux
+                  </button>
+                </div>
+                <CopyLine value={platform === "windows" ? windowsCommand : unixCommand} />
+              </div>
             </div>
 
-            <div className="split-card is-good js-reveal">
-              <div className="split-title">
-                <div>
-                  <div className="panel-title">GradMesh</div>
-                  <div className="small faint">Shards sized to measured throughput</div>
-                </div>
-                <span className="badge badge-live">17s round</span>
+            <div className="ld-hero-stage" aria-hidden="true">
+              <div className="ld-annotation" style={{ top: "16%", left: "4%" }}>
+                <span className="vendor-dot vendor-nvidia" />
+                <span>
+                  <b>orbit 1</b> nvidia · cuda
+                </span>
               </div>
-              <Gantt
-                good
-                rows={[
-                  { name: "RTX 3060", work: 100, idle: 0, label: "17s" },
-                  { name: "Arc A370M", work: 97, idle: 3, label: "17s" },
-                  { name: "GTX 1650", work: 96, idle: 4, label: "16s" },
-                ]}
-              />
-              <p className="small faint" style={{ marginTop: 16 }}>
-                Everyone finishes together, so the round costs what the mesh costs.
-              </p>
+              <div className="ld-annotation" style={{ top: "38%", right: "0%" }}>
+                <span className="vendor-dot vendor-intel" />
+                <span>
+                  <b>orbit 2</b> intel · xpu
+                </span>
+              </div>
+              <div className="ld-annotation" style={{ bottom: "22%", left: "0%" }}>
+                <span className="vendor-dot vendor-apple" />
+                <span>
+                  <b>orbit 3</b> apple · metal
+                </span>
+              </div>
+              <span className="ld-corner ld-corner-tl" />
+              <span className="ld-corner ld-corner-br" />
             </div>
           </div>
-        </div>
-      </section>
 
-      <section className="section" id="scheduler">
-        <div className="container">
-          <div className="section-head js-reveal">
-            <span className="eyebrow">What makes it work</span>
-            <h2>A scheduler that treats heterogeneity as the normal case.</h2>
-            <p>
-              Consumer hardware is never uniform. GradMesh plans for that instead of tolerating it,
-              with four policies that run every single round.
-            </p>
-          </div>
-
-          <div className="grid grid-3" data-stagger>
-            {FEATURES.map((feature, index) => (
-              <article className="feature" key={feature.title}>
-                <span className="feature-index">{String(index + 1).padStart(2, "0")}</span>
-                <h3>{feature.title}</h3>
-                <p>{feature.body}</p>
-              </article>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section className="section" id="how">
-        <div className="container">
-          <div className="section-head js-reveal">
-            <span className="eyebrow">How it works</span>
-            <h2>Four steps, none of which involve a requirements file.</h2>
-            <p>
-              The whole point of this version is that nobody has to understand the pipeline to
-              contribute to it.
-            </p>
-          </div>
-
-          <div className="flow js-reveal">
-            {STEPS.map((step, index) => (
-              <div className="flow-step" key={step.title}>
-                <span className="num-badge">{index + 1}</span>
-                <h3>{step.title}</h3>
-                <p className="small muted">{step.body}</p>
+          <div className="ld-container">
+            <dl className="ld-telemetry" data-hero>
+              <div>
+                <dt>gpu vendors</dt>
+                <dd>3</dd>
               </div>
-            ))}
+              <div>
+                <dt>software stack</dt>
+                <dd>1</dd>
+              </div>
+              <div>
+                <dt>overhead per round</dt>
+                <dd>&lt; 1 s</dd>
+              </div>
+              <div>
+                <dt>leg 1 ceiling, predicted</dt>
+                <dd>1.53×</dd>
+              </div>
+            </dl>
           </div>
+        </section>
 
-          <div className="grid grid-2 js-reveal" style={{ marginTop: 22 }}>
-            <div className="panel">
-              <div className="stack-sm">
-                <span className="eyebrow">On the host</span>
-                <pre className="code">{`npm install\nnpm run dev`}</pre>
-                <p className="small faint">
-                  Creates the Python environment, downloads the base checkpoints, starts the
-                  coordinator and the dashboard, and prints your network address.
+        {/* vendors ---------------------------------------------------------- */}
+        <section
+          id="vendors"
+          className="ld-section"
+          data-scene-x="-0.62"
+          data-scene-y="0"
+          data-scene-zoom="1.08"
+          data-scene-dim="0.1"
+        >
+          <div className="ld-container ld-split ld-split-right">
+            <div className="ld-copy" data-reveal>
+              <span className="ld-index">01 / 05</span>
+              <h2>Three families. One mesh.</h2>
+              <p>
+                CUDA, XPU and Metal machines join the same round on the same pinned stack, so a model trained across a
+                GeForce, an Arc and a MacBook averages exactly like one trained on three of the same card. Every round
+                is reported per vendor.
+              </p>
+              <div className="ld-vendor-grid" data-cascade>
+                {VENDORS.map((vendor) => (
+                  <article key={vendor.key} className={`ld-vendor vendor-${vendor.key}`}>
+                    <header>
+                      <span className="ld-vendor-name">
+                        <span className="vendor-dot" />
+                        {vendor.name}
+                      </span>
+                      <span className="ld-vendor-api">{vendor.api}</span>
+                    </header>
+                    <strong>{vendor.spec}</strong>
+                    <p>{vendor.detail}</p>
+                    <code>{vendor.code}</code>
+                  </article>
+                ))}
+              </div>
+              <div className="ld-stack">
+                <span>reference stack</span>
+                <code>torch 2.13.0</code>
+                <code>torchvision 0.28.0</code>
+                <code>ultralytics 8.4.46</code>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* scheduler --------------------------------------------------------- */}
+        <section
+          id="scheduler"
+          className="ld-section"
+          data-scene-x="0.66"
+          data-scene-y="0.05"
+          data-scene-zoom="0.95"
+          data-scene-dim="0.25"
+        >
+          <div className="ld-container ld-split">
+            <div className="ld-copy" data-reveal>
+              <span className="ld-index">02 / 05</span>
+              <h2>Overhead is part of the plan.</h2>
+              <p>
+                A round costs what the slowest machine costs. v5 models every machine as a fixed overhead plus a
+                per-image rate, learns both from its own rounds, and sizes shards so everyone finishes at once. A
+                machine whose overhead alone outlasts the round sits it out.
+              </p>
+              <div className="ld-equation">
+                <span>T = (N + Σ rᵢ·fᵢ) / Σ rᵢ</span>
+                <span className="ld-equation-sub">nᵢ = rᵢ · (T − fᵢ)</span>
+              </div>
+
+              <div className="ld-schedule" data-grow-root>
+                {(["linear", "affine"] as const).map((arm) => (
+                  <div key={arm} className={`ld-schedule-arm${arm === "affine" ? " is-good" : ""}`}>
+                    <div className="ld-schedule-head">
+                      <span>{arm === "affine" ? "v5 · affine" : "v4 · rate only"}</span>
+                      <b>{Math.max(...SCHEDULE[arm].map((row) => row.total))} s round</b>
+                    </div>
+                    {SCHEDULE[arm].map((row) => (
+                      <div key={row.name} className="ld-schedule-row">
+                        <span>{row.name}</span>
+                        <div className="ld-schedule-track">
+                          <i className="is-fixed" data-grow style={{ width: `${(row.fixed / 55) * 100}%` }} />
+                          <i className="is-work" data-grow style={{ width: `${(row.work / 55) * 100}%` }} />
+                        </div>
+                        <em>{row.total} s</em>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+                <p className="ld-footnote">
+                  Two identical GPUs, one with heavier per-round overhead. Amber is overhead, blue is training. Leg 1
+                  measured 18.77 s of fixed cost per round on an RTX 5070.
                 </p>
               </div>
             </div>
-            <div className="panel">
-              <div className="stack-sm">
-                <span className="eyebrow">On every other machine</span>
-                <pre className="code">{`irm ${origin}/join.ps1 | iex`}</pre>
-                <p className="small faint">
-                  Detects the accelerator, installs the matching PyTorch build, and joins the mesh.
-                  There is a shell equivalent for macOS and Linux.
-                </p>
+          </div>
+        </section>
+
+        {/* round ------------------------------------------------------------- */}
+        <section
+          id="round"
+          className="ld-section ld-section-wide"
+          data-scene-x="0"
+          data-scene-y="0.4"
+          data-scene-zoom="0.62"
+          data-scene-dim="0.6"
+        >
+          <div className="ld-container" data-reveal>
+            <span className="ld-index ld-center">03 / 05</span>
+            <h2 className="ld-center">Anatomy of a round.</h2>
+            <p className="ld-center ld-narrow">
+              Measured on one RTX 3050 with 56 images. Leg 1 paid nineteen seconds of overhead per round; v5 pays under
+              one, because images stay cached, weights move as raw fp32 bytes, and nothing is validated twice.
+            </p>
+            <div className="ld-phases" data-cascade>
+              {PHASES.map((phase) => (
+                <div
+                  key={phase.name}
+                  className={`ld-phase${phase.name === "train" ? " is-train" : ""}`}
+                  style={{ flexGrow: phase.width }}
+                >
+                  <span className="ld-phase-name">{phase.name}</span>
+                  <span className="ld-phase-value">{phase.value}</span>
+                  <span className="ld-phase-note">{phase.note}</span>
+                </div>
+              ))}
+            </div>
+            <div className="ld-facts" data-cascade>
+              <div>
+                <b>every gradient counts</b>
+                <span>Pending gradients flush at the end of each round, so small shards still learn.</span>
+              </div>
+              <div>
+                <b>fp32 end to end</b>
+                <span>Workers send full-precision EMA weights, not a half-precision checkpoint.</span>
+              </div>
+              <div>
+                <b>warmup once</b>
+                <span>Learning-rate warmup in round 1 only, which fixed the accuracy falling after round 1.</span>
               </div>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section className="section" id="trust">
-        <div className="container">
-          <div className="section-head js-reveal">
-            <span className="eyebrow">Trust</span>
-            <h2>A mesh you can actually explain to the person lending you a GPU.</h2>
+        {/* join -------------------------------------------------------------- */}
+        <section
+          id="join"
+          className="ld-section"
+          data-scene-x="-0.62"
+          data-scene-y="0"
+          data-scene-zoom="1.05"
+          data-scene-dim="0.15"
+        >
+          <div className="ld-container ld-split ld-split-right">
+            <div className="ld-copy" data-reveal>
+              <span className="ld-index">04 / 05</span>
+              <h2>One line to join.</h2>
+              <p>
+                It finds Python, detects the GPU, installs the matching build under the home folder, proves the GPU runs
+                a kernel, and joins. Nothing system-wide. Ctrl+C leaves.
+              </p>
+              <div className="ld-terminal">
+                <div className="ld-terminal-bar">
+                  <i />
+                  <i />
+                  <i />
+                  <span>contributor</span>
+                </div>
+                <div className="ld-terminal-body">
+                  <CopyLine value={windowsCommand} label="Windows" />
+                  <CopyLine value={unixCommand} label="macOS and Linux" />
+                </div>
+              </div>
+              <ul className="ld-checks">
+                <li>Python 3.10 to 3.13, offered on Windows if missing</li>
+                <li>Stays awake while contributing, and finds the host again if it moves</li>
+                <li>One worker per GPU; a restart replaces the old process cleanly</li>
+              </ul>
+            </div>
           </div>
+        </section>
 
-          <div className="grid grid-3" data-stagger>
-            <article className="feature">
-              <h3>Nothing leaves the network</h3>
-              <p>
-                Dataset shards, checkpoints and gradient updates travel between machines on your own
-                LAN. There is no upstream service in the path.
-              </p>
-            </article>
-            <article className="feature">
-              <h3>Joining takes a token</h3>
-              <p>
-                Workers present a mesh token before they receive any data. Rotate it from the
-                dashboard and every uninvited machine drops out.
-              </p>
-            </article>
-            <article className="feature">
-              <h3>Every decision is legible</h3>
-              <p>
-                Admission, shard size and drops all carry a written reason. Contributors can see
-                exactly what their machine did and why.
-              </p>
-            </article>
+        {/* trust ------------------------------------------------------------- */}
+        <section className="ld-section" data-scene-x="0.62" data-scene-y="0" data-scene-zoom="1" data-scene-dim="0.3">
+          <div className="ld-container ld-split">
+            <div className="ld-copy" data-reveal>
+              <span className="ld-index">05 / 05</span>
+              <h2>Nothing leaves the network.</h2>
+              <div className="ld-trust" data-cascade>
+                <div>
+                  <b>LAN only</b>
+                  <span>Shards, checkpoints and updates move between machines you can see. Telemetry off.</span>
+                </div>
+                <div>
+                  <b>Token to join</b>
+                  <span>Workers present a mesh token before any data. Rotate it and every machine drops out.</span>
+                </div>
+                <div>
+                  <b>Every decision explained</b>
+                  <span>Admission, shard size, drops and slowdowns each carry a written reason.</span>
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section className="section">
-        <div className="container">
-          <div className="cta js-reveal">
-            <span className="eyebrow">Ready</span>
-            <h2 style={{ marginTop: 14 }}>
-              The cluster you were going to rent is already on your Wi-Fi.
-            </h2>
-            <div
-              className="row"
-              style={{ justifyContent: "center", marginTop: 28, flexWrap: "wrap" }}
-            >
-              <Link className="btn btn-primary btn-lg" href={dashboardHref}>
-                {needsFirstAccount ? "Claim this mesh" : "Open the dashboard"}
+        <section className="ld-cta" data-scene-x="0" data-scene-y="0.7" data-scene-zoom="0.8" data-scene-dim="0">
+          <div className="ld-container" data-reveal>
+            <h2>The cluster you were going to rent is already on your Wi-Fi.</h2>
+            <div className="ld-actions ld-actions-center">
+              <Link className="ld-btn ld-btn-solid ld-btn-lg" href={dashboardHref}>
+                {primaryLabel}
+                <span aria-hidden="true">→</span>
               </Link>
-              <Link className="btn btn-lg" href="/join">
+              <Link className="ld-btn ld-btn-ghost ld-btn-lg" href="/join">
                 Lend a GPU instead
               </Link>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
+      </main>
 
-      <footer className="footer">
-        <div className="container row-between">
-          <div className="row" style={{ gap: 9 }}>
+      <footer className="ld-footer">
+        <div className="ld-container ld-footer-inner">
+          <span className="ld-brand">
             <Logo size={18} />
             <span>GradMesh 5</span>
-          </div>
-          <span className="small">
-            Collaborative GPU training over an ordinary network. Research prototype.
           </span>
+          <span>Collaborative GPU training over an ordinary network. Research prototype.</span>
+          <a href={CREDIT_URL} target="_blank" rel="noreferrer">
+            Scene: “space boi” by silvercrow101, CC BY-NC 4.0
+          </a>
         </div>
       </footer>
-    </div>
-  );
-}
-
-function Gantt({
-  rows,
-  good = false,
-}: {
-  rows: { name: string; work: number; idle: number; label: string }[];
-  good?: boolean;
-}) {
-  return (
-    <div className="gantt">
-      {rows.map((row) => (
-        <div className="gantt-row" key={row.name}>
-          <span className="small muted truncate">{row.name}</span>
-          <div className="gantt-track">
-            <div
-              className={`gantt-bar${good ? " is-good" : ""}`}
-              data-bar
-              style={{ width: `${row.work}%` }}
-            />
-          </div>
-          <span className="small mono faint" style={{ textAlign: "right" }}>
-            {row.label}
-          </span>
-        </div>
-      ))}
     </div>
   );
 }

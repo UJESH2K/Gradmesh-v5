@@ -2,6 +2,7 @@
 
 import { ago, gflops, memory, seconds } from "@/lib/format";
 import type { MeshNode } from "@/lib/types";
+import SoftwareStack from "./SoftwareStack";
 import { Meter, TierBadge } from "./ui";
 import VendorBadge from "./VendorBadge";
 
@@ -125,11 +126,13 @@ export default function NodeCard({
         </ul>
       ) : null}
 
+      <SoftwareStack node={node} />
+
       {diag.cpu ? (
         <p className="small faint truncate" title={diag.cpu}>
           {diag.cpu}
-          {diag.os ? ` · ${diag.os}` : ""}
-          {node.capability?.torch_version ? ` · torch ${node.capability.torch_version}` : ""}
+          {diag.ram_mb ? ` · ${memory(diag.ram_mb)} RAM` : ""}
+          {diag.thermal_state && diag.thermal_state !== "nominal" ? ` · thermal ${diag.thermal_state}` : ""}
         </p>
       ) : null}
 

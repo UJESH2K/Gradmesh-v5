@@ -47,7 +47,8 @@ const VENDOR_STEPS: Record<string, { before: string[]; drivers?: { label: string
   mps: {
     before: [
       "An Apple Silicon Mac (M1 or later) on macOS 14 Sonoma or newer. Intel Macs cannot run current PyTorch.",
-      "Python 3.10 to 3.13 from Homebrew (brew install python@3.12) or python.org; the built-in python3 is too old.",
+      "An Apple Silicon Python 3.10 to 3.13: brew install python@3.12 (Homebrew in /opt/homebrew) or python.org. The built-in python3 is too old, and an Intel Python under Rosetta has no PyTorch; the command picks the native one.",
+      "On the day: plugged in, lid open on a hard surface, Low Power Mode off, browsers closed. An 8 GB Mac shares that memory with the GPU. Docs: docs/MAC-M1.md.",
     ],
   },
 };
@@ -127,7 +128,10 @@ export default async function SetupPage() {
     checks.push({ name: "Build note", level: "warn", detail: warning });
   }
 
+  // The coordinator compares torch, torchvision and Ultralytics per machine;
+  // fall back to the torch version alone for a host that predates that.
   const offStack = (mesh?.nodes || []).filter((node) => {
+    if (node.software) return node.software.on_reference === false;
     const version = String(node.capability?.torch_version || "").split("+")[0];
     return version && version !== reference.torch;
   });
@@ -178,7 +182,14 @@ export default async function SetupPage() {
           <strong>
             {offStack.length} machine{offStack.length === 1 ? " is" : "s are"} not on the reference stack.
           </strong>{" "}
-          {offStack.map((node) => `${node.display_name} (torch ${node.capability?.torch_version})`).join(", ")}. Their
+          {offStack
+            .map((node) =>
+              node.software?.drift.length
+                ? `${node.display_name} (${node.software.drift.join(", ")})`
+                : `${node.display_name} (torch ${node.capability?.torch_version})`
+            )
+            .join("; ")}
+          . Their
           results are not directly comparable with the rest; rerunning the join command on them updates them.
         </div>
       ) : null}

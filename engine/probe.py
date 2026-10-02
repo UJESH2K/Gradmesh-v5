@@ -47,9 +47,61 @@ class Capability:
     supports_training: bool
     supports_amp: bool
     compute_capability: Optional[str] = None
+    # The software this machine trains with, shown per machine on the
+    # dashboard: a cross-vendor result is only comparable if every machine ran
+    # the same stack, so drift has to be visible, not just possible.
+    python_version: str = ""
+    torchvision_version: str = ""
+    ultralytics_version: str = ""
+    runtime: str = ""  # "CUDA 13.0", "Intel XPU", "Metal"
+    os_version: str = ""  # "macOS 14.5", "Windows 11 (build 26200)", "Ubuntu 24.04 LTS"
+    gpu_cores: Optional[int] = None  # Apple reports these; NVIDIA and Intel do not here
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+def _package_version(name: str) -> str:
+    """Installed version without importing the package (Ultralytics takes seconds)."""
+    try:
+        from importlib.metadata import version
+
+        return version(name)
+    except Exception:
+        return ""
+
+
+def friendly_os() -> str:
+    """The operating system as a person would name it, not the kernel release."""
+    try:
+        if sys.platform == "darwin":
+            release = platform.mac_ver()[0]
+            return "macOS %s" % release if release else "macOS"
+        if sys.platform == "win32":
+            build = platform.version().split(".")[-1]
+            name = "Windows 11" if build.isdigit() and int(build) >= 22000 else "Windows %s" % platform.release()
+            return "%s (build %s)" % (name, build) if build.isdigit() else name
+        release = getattr(platform, "freedesktop_os_release", None)
+        if release:
+            pretty = release().get("PRETTY_NAME")
+            if pretty:
+                return pretty
+    except Exception:
+        pass
+    return "%s %s" % (platform.system(), platform.release())
+
+
+def _runtime(torch, backend: str) -> str:
+    try:
+        if backend == "cuda" and getattr(torch.version, "cuda", None):
+            return "CUDA %s" % torch.version.cuda
+        if backend == "xpu":
+            return "Intel XPU"
+        if backend == "mps":
+            return "Metal"
+    except Exception:
+        pass
+    return "CPU" if backend == "cpu" else backend
 
 
 def _timed_matmul(torch, accelerator: Accelerator, size: int, iters: int) -> float:
@@ -136,6 +188,12 @@ def probe(accelerator: Accelerator) -> Capability:
         supports_training=accelerator.supports_training,
         supports_amp=accelerator.supports_amp,
         compute_capability=capability,
+        python_version=platform.python_version(),
+        torchvision_version=_package_version("torchvision"),
+        ultralytics_version=_package_version("ultralytics"),
+        runtime=_runtime(torch, accelerator.backend),
+        os_version=friendly_os(),
+        gpu_cores=accelerator.gpu_cores,
     )
 
 
@@ -333,6 +391,62 @@ def _nvidia_diagnostics(index: int = 0) -> Dict[str, object]:
     }
 
 
+# NSProcessInfo.thermalState: what macOS itself says about heat. A fanless
+# MacBook Air reaches "serious" after a few minutes of sustained GPU load and
+# slows the GPU to cool down, which is exactly the slowdown a person should see
+# explained on the dashboard.
+_THERMAL_STATES = {0: "nominal", 1: "fair", 2: "serious", 3: "critical"}
+_process_info = None
+
+
+def _macos_process_info():
+    """(thermal state, Low Power Mode) from Foundation, through the Objective-C runtime.
+
+    ctypes rather than PyObjC, which the agent does not install. Each message
+    gets its own typed function pointer: objc_msgSend must be called with the
+    exact signature of the method on arm64.
+    """
+    global _process_info
+    if _process_info is None:
+        import ctypes
+        import ctypes.util
+
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc") or "/usr/lib/libobjc.dylib")
+        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Foundation.framework/Foundation")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        address = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+        send_id = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(address)
+        send_long = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)(address)
+        send_bool = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(address)
+        info = send_id(objc.objc_getClass(b"NSProcessInfo"), objc.sel_registerName(b"processInfo"))
+        if not info:
+            raise RuntimeError("NSProcessInfo unavailable")
+        _process_info = (info, objc, send_long, send_bool)
+    info, objc, send_long, send_bool = _process_info
+    thermal = _THERMAL_STATES.get(int(send_long(info, objc.sel_registerName(b"thermalState"))))
+    low_power = bool(send_bool(info, objc.sel_registerName(b"isLowPowerModeEnabled")))
+    return thermal, low_power
+
+
+def _macos_diagnostics() -> Dict[str, object]:
+    info: Dict[str, object] = {}
+    try:
+        thermal, low_power = _macos_process_info()
+        if thermal:
+            info["thermal_state"] = thermal
+        info["low_power_mode"] = low_power
+    except Exception:
+        # pmset reports Low Power Mode on macOS 12 and newer.
+        raw = _run(["pmset", "-g"]) or ""
+        match = re.search(r"lowpowermode\s+(\d)", raw)
+        if match:
+            info["low_power_mode"] = match.group(1) == "1"
+    return info
+
+
 def diagnostics(accelerator: Optional[Accelerator] = None, gpu_index: int = 0, sample_cpu: bool = True) -> dict:
     """Everything about this host that can make an identical GPU train slower.
 
@@ -351,6 +465,7 @@ def diagnostics(accelerator: Optional[Accelerator] = None, gpu_index: int = 0, s
         info["cpu_physical"] = psutil.cpu_count(logical=False)
         info["ram_mb"] = int(psutil.virtual_memory().total / 2**20)
         info["ram_available_mb"] = int(psutil.virtual_memory().available / 2**20)
+        info["swap_used_mb"] = int(psutil.swap_memory().used / 2**20)
         if sample_cpu:
             info["cpu_load"] = psutil.cpu_percent(interval=0.2)
         battery = psutil.sensors_battery() if hasattr(psutil, "sensors_battery") else None
@@ -363,6 +478,14 @@ def diagnostics(accelerator: Optional[Accelerator] = None, gpu_index: int = 0, s
     plan = _power_plan()
     if plan:
         info["power_plan"] = plan
+    if sys.platform == "darwin":
+        info.update(_macos_diagnostics())
+    try:
+        # The image cache and the PyTorch install live under the home folder;
+        # a 256 GB laptop can run short.
+        info["disk_free_mb"] = int(shutil.disk_usage(os.path.expanduser("~")).free / 2**20)
+    except Exception:
+        pass
 
     if accelerator is not None and accelerator.backend == "cuda":
         info.update(_nvidia_diagnostics(gpu_index))

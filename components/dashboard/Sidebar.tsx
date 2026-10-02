@@ -60,6 +60,20 @@ export default function Sidebar({
           <span className={`dot${connected ? " dot-live" : ""}`} style={connected ? undefined : { background: "var(--text-faint)" }} />
           <span className="faint">{connected ? "Live" : "Reconnecting"}</span>
         </div>
+        {mesh?.version ? (
+          <Link
+            href="/dashboard/setup"
+            className="dash-stack"
+            title="The GradMesh version on this host, and the stack every machine is pinned to"
+          >
+            <span>GradMesh {mesh.version}</span>
+            {mesh.reference_stack ? (
+              <span className="mono">
+                torch {mesh.reference_stack.torch} · ultralytics {mesh.reference_stack.ultralytics}
+              </span>
+            ) : null}
+          </Link>
+        ) : null}
         <div style={{ padding: "0 8px" }}>
           <div className="small truncate">{user.name}</div>
           <div className="small faint truncate">{user.role === "owner" ? "Mesh owner" : "Member"}</div>

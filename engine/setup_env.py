@@ -588,6 +588,70 @@ def install(
 
 
 # ---------------------------------------------------------------------------
+# Apple Silicon: never run under Rosetta
+# ---------------------------------------------------------------------------
+
+# Native interpreters worth trying when the one that started us is translated.
+_NATIVE_MAC_PYTHONS = [
+    "/opt/homebrew/bin/python3.12",
+    "/opt/homebrew/bin/python3.11",
+    "/opt/homebrew/bin/python3.13",
+    "/opt/homebrew/bin/python3.10",
+    "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+    "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
+    "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
+    "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
+]
+
+
+def _runs_natively(python: str) -> bool:
+    """Does `python` have an arm64 build of a supported version?"""
+    try:
+        result = subprocess.run(
+            ["/usr/bin/arch", "-arm64", python, "-c",
+             "import platform,sys;print(platform.machine(), sys.version_info[0], sys.version_info[1])"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        return False
+    parts = (result.stdout or "").split()
+    return (
+        result.returncode == 0
+        and len(parts) == 3
+        and parts[0] == "arm64"
+        and python_supported((int(parts[1]), int(parts[2])))
+    )
+
+
+def relaunch_natively_if_translated(argv: List[str]) -> None:
+    """On an Apple Silicon Mac, restart this script as arm64 if it is running under Rosetta.
+
+    An Intel Python on an M-series Mac works, slowly, for everything except the
+    one thing GradMesh needs: PyTorch has no Intel-Mac wheels, so the install
+    would fail or the Mac would be turned away as an Intel Mac. The usual cause
+    is a python.org universal build launched from a Terminal set to "Open
+    using Rosetta", or an old Intel Homebrew in /usr/local. A universal build
+    can simply be relaunched as arm64; otherwise a native Homebrew or python.org
+    interpreter is used if one is installed. If neither exists, hardware.py
+    blocks the profile with instructions.
+    """
+    if sys.platform != "darwin" or os.environ.get("GRADMESH_NATIVE_RELAUNCH"):
+        return
+    if not hardware.under_rosetta() or not os.path.exists("/usr/bin/arch"):
+        return
+    script = str(Path(__file__).resolve())
+    for candidate in [sys.executable] + _NATIVE_MAC_PYTHONS:
+        if candidate and os.path.exists(candidate) and _runs_natively(candidate):
+            say("this Python was running under Rosetta; restarting as Apple Silicon (%s)" % candidate, "yellow")
+            os.environ["GRADMESH_NATIVE_RELAUNCH"] = "1"
+            sys.stdout.flush()
+            os.execv("/usr/bin/arch", ["/usr/bin/arch", "-arm64", candidate, script] + list(argv))
+    # Nothing native to hand over to; select_profile explains what to install.
+
+
+# ---------------------------------------------------------------------------
 # The join flow
 # ---------------------------------------------------------------------------
 
@@ -687,6 +751,7 @@ def run_agent(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    relaunch_natively_if_translated(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Build and verify a GradMesh Python environment")
     sub = parser.add_subparsers(dest="command", required=True)
 

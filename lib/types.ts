@@ -18,6 +18,33 @@ export type Capability = {
   supports_training: boolean;
   supports_amp?: boolean;
   compute_capability?: string | null;
+  // v5.1: the software each machine trains with.
+  python_version?: string;
+  torchvision_version?: string;
+  ultralytics_version?: string;
+  /** "CUDA 13.0", "Intel XPU", "Metal". */
+  runtime?: string;
+  /** "macOS 14.5", "Windows 11 (build 26200)". */
+  os_version?: string;
+  gpu_cores?: number | null;
+};
+
+/** A machine's training stack as the coordinator sees it, against the pinned reference. */
+export type NodeSoftware = {
+  python: string;
+  torch: string;
+  /** The wheel flavour: cu130, cu126, xpu, macOS, cpu. */
+  torch_build: string;
+  torchvision: string;
+  ultralytics: string;
+  runtime: string;
+  os: string;
+  driver: string;
+  agent: string;
+  agent_behind: boolean;
+  /** null when an older agent did not report enough to tell. */
+  on_reference: boolean | null;
+  drift: string[];
 };
 
 /** What the worker reports about its host, refreshed every half minute. */
@@ -33,6 +60,11 @@ export type HostDiagnostics = {
   on_battery?: boolean;
   battery_percent?: number;
   power_plan?: string;
+  swap_used_mb?: number;
+  disk_free_mb?: number;
+  /** macOS: nominal, fair, serious, critical. */
+  thermal_state?: string;
+  low_power_mode?: boolean;
   gpu_utilization?: number | null;
   gpu_temperature_c?: number | null;
   sm_clock_mhz?: number | null;
@@ -96,6 +128,7 @@ export type MeshNode = {
   workload?: string;
   batch_cap?: number | null;
   address?: string | null;
+  software?: NodeSoftware;
 };
 
 export type ShardAssignment = {

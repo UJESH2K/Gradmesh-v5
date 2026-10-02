@@ -43,4 +43,25 @@ def health_warnings(diag: Optional[dict], co_located: bool = False) -> List[str]
     available = diag.get("ram_available_mb")
     if isinstance(available, (int, float)) and available < 1500:
         warnings.append("only %d MB of system memory free" % int(available))
+
+    # macOS. A fanless MacBook Air has no fan to spin up: when it gets hot it
+    # lowers the GPU clock, and macOS says so through its thermal state.
+    thermal = str(diag.get("thermal_state") or "")
+    if thermal in {"serious", "critical"}:
+        warnings.append(
+            "macOS reports a %s thermal state, so it is slowing the chip to cool down; give the Mac airflow "
+            "(lid open, on a hard surface, out of the sun)" % thermal
+        )
+    if diag.get("low_power_mode"):
+        warnings.append("Low Power Mode is on, which caps CPU and GPU clocks; turn it off in System Settings > Battery")
+    swap = diag.get("swap_used_mb")
+    ram = diag.get("ram_mb")
+    if isinstance(swap, (int, float)) and isinstance(ram, (int, float)) and ram <= 8704 and swap >= 2048:
+        warnings.append(
+            "%.1f GB of swap in use on a %d GB machine: memory is short and training may be paging to the SSD"
+            % (swap / 1024.0, round(ram / 1024.0))
+        )
+    disk = diag.get("disk_free_mb")
+    if isinstance(disk, (int, float)) and disk < 5120:
+        warnings.append("only %.1f GB free on disk; the image cache and PyTorch need room" % (disk / 1024.0))
     return warnings

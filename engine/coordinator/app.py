@@ -74,6 +74,7 @@ from coordinator import (
 )
 from coordinator.events import bus
 from coordinator.health import health_warnings
+from coordinator.software import software_view
 from version import PROTOCOL, REFERENCE_STACK, __version__
 
 from coordinator.scheduler import (
@@ -258,6 +259,9 @@ def _node_view(node: dict, mesh: dict, policy: MeshPolicy, key: Optional[str] = 
     view["fitness"] = round(fitness(node, mesh, policy), 4)
     view["vendor"] = node.get("vendor") or VENDOR_OF.get(node.get("backend") or "", "cpu")
     view["warnings"] = health_warnings(node.get("diagnostics"), bool(node.get("co_located")))
+    view["software"] = software_view(
+        node.get("capability"), node.get("diagnostics"), node.get("agent_version"), REFERENCE_STACK, __version__
+    )
     view["workload"] = key
     return view
 

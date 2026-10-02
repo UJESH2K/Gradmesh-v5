@@ -117,8 +117,19 @@ needs, without installing anything.
 
 1. **Python**: `brew install python@3.12`, or the macOS installer from
    python.org. The built-in `/usr/bin/python3` is 3.9 and is too old.
+   It must be the **Apple Silicon (arm64)** build. An Intel Python runs under
+   Rosetta, where PyTorch publishes nothing. Homebrew in `/opt/homebrew` is
+   arm64. The join command prefers it, runs every candidate as arm64, and
+   restarts setup natively if it finds itself under Rosetta. Check with
+   `python3.12 -c "import platform; print(platform.machine())"`, which must
+   print `arm64`.
 2. **Node.js** (host only): `brew install node`
 3. macOS **14 Sonoma or newer**: System Settings > General > Software Update.
+4. **For a run:** plugged in, Low Power Mode off, lid open, heavy apps closed.
+   On an 8 GB Mac the GPU shares that memory with everything else, so the worker
+   caps Metal at its recommended working set. An oversized batch then fails
+   and is halved instead of swapping. The full checklist for the 8 GB MacBook
+   Air M1 test machine is in [docs/MAC-M1.md](docs/MAC-M1.md).
 
 ### Linux (Ubuntu / Debian shown)
 
@@ -251,6 +262,7 @@ of images do not sync.
 | `GRADMESH_HEARTBEAT_TIMEOUT` | 20 | seconds of silence before a worker counts as offline (three times that while it holds a shard) |
 | `GRADMESH_AGENT_HOME` | `~/.gradmesh/agent` | where the join flow installs |
 | `GRADMESH_WORKER_HOME` | `~/.gradmesh` | worker cache, models and locks |
+| `PYTORCH_MPS_HIGH_WATERMARK_RATIO` | 1.0 on Macs with 8 GB or less, else PyTorch's 1.7 | Metal allocation ceiling as a multiple of the recommended working set; set it yourself to override (keep `PYTORCH_MPS_LOW_WATERMARK_RATIO` at or below it) |
 
 ---
 
@@ -282,6 +294,9 @@ Run `npm run doctor` first. The usual causes, by symptom:
 | `torch.cuda.is_available() is False` after install | NVIDIA driver missing or too old for the build | update the driver (R580+), rerun setup |
 | `torch.xpu.is_available() is False` | Intel driver or compute runtime missing | install them (section 2), rerun |
 | MPS unavailable on a Mac | macOS older than 14 | update macOS |
+| `the Python that ran this is an Intel (x86_64) build` on a Mac | an Intel Python under Rosetta, with no native one installed | `brew install python@3.12`, rerun the join command |
+| `out of memory (Metal, unified memory ...)` | an 8 GB Mac with other apps holding memory | automatic: the batch halves next round; quit other apps |
+| a Mac's rate drops after a few rounds; card says *serious thermal state* | a fanless MacBook Air slowing down to cool | airflow (lid open, hard surface, stand); the scheduler adapts either way |
 | the environment "will not start" / rebuilt on every run | it was synced from another machine | nothing; v5 rebuilds it machine-locally once |
 | `next dev` fails with a missing `@next/swc-...` | `node_modules` from another OS | delete `node_modules`, `npm install` |
 | a contributor cannot reach the host | firewall, or a different network | `Test-NetConnection HOST -Port 8000` (Windows) or `nc -vz HOST 8000`; add the firewall rule |

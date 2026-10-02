@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 import NodeCard from "@/components/dashboard/NodeCard";
+import { nodeSoftware, ReferenceBadge } from "@/components/dashboard/SoftwareStack";
 import VendorBadge from "@/components/dashboard/VendorBadge";
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import { Empty, Panel, TierBadge } from "@/components/dashboard/ui";
@@ -130,6 +131,7 @@ export default function NodesView({ canManage }: { canManage: boolean }) {
                 <tr>
                   <th>Machine</th>
                   <th>Vendor</th>
+                  <th>Software</th>
                   <th className="num">Measured</th>
                   <th className="num">Memory</th>
                   <th className="num">Rate</th>
@@ -162,6 +164,22 @@ export default function NodesView({ canManage }: { canManage: boolean }) {
                     </td>
                     <td>
                       <VendorBadge backend={node.backend} compact />
+                    </td>
+                    <td>
+                      {(() => {
+                        const software = nodeSoftware(node);
+                        return (
+                          <div className="stack-sm" style={{ gap: 3 }}>
+                            <span className="mono small">
+                              {software.torch ? `torch ${software.torch}` : "—"}
+                              {software.torch_build ? ` · ${software.torch_build}` : ""}
+                            </span>
+                            <span className="small faint truncate">
+                              {[software.python && `py ${software.python}`, software.os].filter(Boolean).join(" · ")}
+                            </span>
+                          </div>
+                        );
+                      })()}
                     </td>
                     <td className="num">{gflops(node.capability?.gflops)}</td>
                     <td className="num">{memory(node.gpu_memory_mb)}</td>
@@ -208,6 +226,76 @@ export default function NodesView({ canManage }: { canManage: boolean }) {
           </div>
         </Panel>
       )}
+
+      {nodes.length > 0 ? (
+        <Panel
+          title="Software on each machine"
+          action={
+            mesh.reference_stack ? (
+              <span className="small faint mono">
+                reference: torch {mesh.reference_stack.torch} · torchvision {mesh.reference_stack.torchvision} ·
+                ultralytics {mesh.reference_stack.ultralytics}
+              </span>
+            ) : null
+          }
+          flush
+        >
+          <div className="table-scroll">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Machine</th>
+                  <th>OS</th>
+                  <th>Python</th>
+                  <th>PyTorch</th>
+                  <th>torchvision</th>
+                  <th>Ultralytics</th>
+                  <th>Runtime</th>
+                  <th>Agent</th>
+                  <th>Stack</th>
+                </tr>
+              </thead>
+              <tbody>
+                {nodes.map((node) => {
+                  const software = nodeSoftware(node);
+                  return (
+                    <tr key={node.node_id} title={software.drift.join("; ") || undefined}>
+                      <td>
+                        <div className="row" style={{ gap: 8 }}>
+                          <VendorBadge backend={node.backend} compact />
+                          <span className="truncate">{node.display_name}</span>
+                        </div>
+                      </td>
+                      <td className="small" style={{ whiteSpace: "nowrap" }}>{software.os || "—"}</td>
+                      <td className="mono small">{software.python || "—"}</td>
+                      <td className="mono small" style={{ whiteSpace: "nowrap" }}>
+                        {software.torch || "—"}
+                        {software.torch_build ? <span className="faint"> · {software.torch_build}</span> : null}
+                      </td>
+                      <td className="mono small">{software.torchvision || "—"}</td>
+                      <td className="mono small">{software.ultralytics || "—"}</td>
+                      <td className="small" style={{ whiteSpace: "nowrap" }}>
+                        {software.runtime || "—"}
+                        {software.driver ? <span className="faint"> · driver {software.driver}</span> : null}
+                      </td>
+                      <td
+                        className="mono small"
+                        style={software.agent_behind ? { color: "var(--warn)" } : undefined}
+                        title={software.agent_behind ? "Older than the host; re-run the join command on this machine" : undefined}
+                      >
+                        {software.agent || "—"}
+                      </td>
+                      <td>
+                        <ReferenceBadge software={software} />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      ) : null}
 
       <Panel title="Contribution totals">
         <div className="table-scroll">

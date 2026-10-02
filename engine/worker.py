@@ -68,6 +68,38 @@ os.environ.setdefault("YOLO_AUTOINSTALL", "false")
 os.environ.setdefault("YOLO_VERBOSE", "false")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
+
+def cap_metal_memory() -> Optional[str]:
+    """On a Mac with 8 GB or less, stop Metal from paging training to the SSD.
+
+    By default PyTorch lets MPS allocate up to 1.7 times the working set Metal
+    recommends. On a 16 GB Mac that is headroom; on an 8 GB MacBook Air it is
+    more memory than the machine has, so an oversized batch does not fail, it
+    swaps: the round crawls, the whole Mac stalls, and the SSD takes the writes.
+    Capping allocations at the recommended working set turns that into a clean
+    "MPS backend out of memory", which the coordinator answers by halving the
+    batch for the next round. Must run before torch is imported; a value the
+    person set themselves is left alone.
+    """
+    if sys.platform != "darwin" or "PYTORCH_MPS_HIGH_WATERMARK_RATIO" in os.environ:
+        return None
+    try:
+        total = int(
+            subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3).stdout.strip()
+        )
+    except Exception:
+        return None
+    if total > (8 * 1024 + 512) * 2**20:
+        return None
+    # The low watermark is where MPS starts collecting and committing early; it
+    # must not exceed the high one, or PyTorch refuses to start.
+    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "1.0"
+    os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.8")
+    return "%d GB of unified memory: Metal allocations capped at the recommended working set" % round(total / 2**30)
+
+
+METAL_MEMORY_NOTE = cap_metal_memory()
+
 AGENT_VERSION = __version__
 FEATURES = ["binary-weights", "image-cache", "phase-timing", "diagnostics", "instance-id"]
 WORKER_HOME = Path(os.getenv("GRADMESH_WORKER_HOME", str(Path.home() / ".gradmesh")))
@@ -1075,6 +1107,13 @@ class Agent:
             message = (
                 "out of memory (system RAM, not GPU) at batch %s: close other applications on this machine. %s"
                 % (batch.get("batch_size"), message)
+            )
+        elif "mps backend out of memory" in lowered:
+            # Apple's GPU memory is the Mac's RAM, so other apps are competing
+            # for it too; the next round's batch is halved either way.
+            message = (
+                "out of memory (Metal, unified memory shared with macOS and open apps) at batch %s: quit "
+                "browsers and other large apps on this Mac. %s" % (batch.get("batch_size"), message)
             )
         elif "out of memory" in lowered or "outofmemory" in lowered:
             message = "out of memory (GPU) at batch %s: %s" % (batch.get("batch_size"), message)

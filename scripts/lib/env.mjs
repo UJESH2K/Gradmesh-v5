@@ -80,38 +80,50 @@ function versionSupported(major, minor) {
  *
  * Windows ships a `python` shim that opens the Microsoft Store instead of
  * running anything, so a version check is the only reliable probe.
+ *
+ * On an Apple Silicon Mac the interpreter must be arm64 as well: an Intel
+ * Python runs under Rosetta, where PyTorch publishes nothing. Homebrew's
+ * /opt/homebrew (arm64 only) is tried first, and an x86_64 interpreter is
+ * passed over with a note rather than picked.
  */
 export function findSystemPython() {
   const preferred = ["3.12", "3.11", "3.13", "3.10"];
   const candidates = IS_WINDOWS
     ? [...preferred.map((version) => `py -${version}`), "python", "python3"]
-    : [
-        ...preferred.map((version) => `python${version}`),
-        ...(process.platform === "darwin"
-          ? preferred.flatMap((version) => [
-              `/opt/homebrew/bin/python${version}`,
-              `/usr/local/bin/python${version}`,
-              `/Library/Frameworks/Python.framework/Versions/${version}/bin/python3`,
-            ])
-          : []),
-        "python3",
-        "python",
-      ];
+    : process.platform === "darwin"
+      ? [
+          ...preferred.map((version) => `/opt/homebrew/bin/python${version}`),
+          ...preferred.map((version) => `/Library/Frameworks/Python.framework/Versions/${version}/bin/python3`),
+          ...preferred.map((version) => `python${version}`),
+          ...preferred.map((version) => `/usr/local/bin/python${version}`),
+          "python3",
+        ]
+      : [...preferred.map((version) => `python${version}`), "python3", "python"];
+  const needArm64 = appleSilicon();
 
   const rejected = [];
   for (const candidate of candidates) {
     const [command, ...args] = candidate.startsWith("/") ? [candidate] : candidate.split(" ");
+    if (candidate.startsWith("/") && !existsSync(candidate)) continue;
     // No shell here: cmd.exe mangles the quoting, and PATH lookup for .exe
     // files works without one anyway.
     const probe = spawnSync(
       command,
-      [...args, "-c", "import sys;print(sys.version_info.major);print(sys.version_info.minor);print(sys.executable)"],
+      [
+        ...args,
+        "-c",
+        "import sys,platform;print(sys.version_info.major);print(sys.version_info.minor);print(sys.executable);print(platform.machine())",
+      ],
       { encoding: "utf8", windowsHide: true }
     );
     if (probe.status !== 0) continue;
-    const [majorText, minorText, executable] = (probe.stdout || "").trim().split(/\r?\n/);
+    const [majorText, minorText, executable, machine] = (probe.stdout || "").trim().split(/\r?\n/);
     const major = Number(majorText);
     const minor = Number(minorText);
+    if (needArm64 && machine?.trim() !== "arm64") {
+      rejected.push(`${major}.${minor} (an Intel build, which runs under Rosetta)`);
+      continue;
+    }
     if (major === 3 && versionSupported(major, minor)) {
       return { command, args, version: `${major}.${minor}`, executable: executable?.trim() };
     }
@@ -120,9 +132,18 @@ export function findSystemPython() {
   return rejected.length ? { missing: true, rejected: [...new Set(rejected)] } : null;
 }
 
+/** An Apple Silicon Mac, even when Node itself runs under Rosetta. */
+export function appleSilicon() {
+  if (process.platform !== "darwin") return false;
+  if (process.arch === "arm64") return true;
+  const probe = spawnSync("sysctl", ["-n", "hw.optional.arm64"], { encoding: "utf8" });
+  return probe.status === 0 && probe.stdout.trim() === "1";
+}
+
 export function pythonInstallHint() {
   if (IS_WINDOWS) return "winget install Python.Python.3.12";
-  if (process.platform === "darwin") return "brew install python@3.12   (macOS's built-in python3 is 3.9, too old)";
+  if (process.platform === "darwin")
+    return "brew install python@3.12   (Homebrew in /opt/homebrew is the Apple Silicon build; macOS's own python3 is 3.9)";
   return "sudo apt install python3.12 python3.12-venv   (or your distribution's equivalent)";
 }
 

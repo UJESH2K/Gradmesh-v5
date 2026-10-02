@@ -171,30 +171,51 @@ printf '\\033[90m  joining %s\\033[0m\\n\\n' "$MESH_COORDINATOR"
 
 # --- Python -----------------------------------------------------------------
 # PyTorch 2.13 publishes wheels for Python 3.10 to 3.13. macOS's own
-# /usr/bin/python3 is 3.9, so on a Mac this usually finds Homebrew's or the
-# python.org install.
+# /usr/bin/python3 is 3.9 (and, without the developer tools, a stub that opens
+# an installer dialog), so it is never tried.
+#
+# On an Apple Silicon Mac the interpreter must also be arm64. An Intel build
+# runs under Rosetta, where PyTorch has nothing to install, so every candidate
+# is run through "arch -arm64": an Intel-only Python then fails the check
+# instead of being picked. Homebrew's /opt/homebrew is arm64-only, so it goes
+# first.
+RUN=""
+CANDIDATES="python3.12 python3.11 python3.13 python3.10 python3 python"
+if [ "$(uname -s)" = "Darwin" ]; then
+  if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+    RUN="/usr/bin/arch -arm64"
+  fi
+  CANDIDATES="/opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.10
+              /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+              /Library/Frameworks/Python.framework/Versions/3.11/bin/python3
+              /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
+              python3.12 python3.11 python3.13 python3.10
+              /usr/local/bin/python3.12 /usr/local/bin/python3.11 /usr/local/bin/python3.13 python3"
+fi
 PYTHON=""
-for candidate in python3.12 python3.11 python3.13 python3.10 \\
-                 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.13 \\
-                 /usr/local/bin/python3.12 /usr/local/bin/python3.11 /usr/local/bin/python3.13 \\
-                 /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \\
-                 python3 python; do
-  if command -v "$candidate" >/dev/null 2>&1; then
-    version=$("$candidate" -c 'import sys; print(sys.version_info.major * 100 + sys.version_info.minor)' 2>/dev/null || echo 0)
-    if [ "$version" -ge 310 ] 2>/dev/null && [ "$version" -le 313 ] 2>/dev/null; then
-      PYTHON="$candidate"
-      break
-    fi
+for candidate in $CANDIDATES; do
+  resolved=$(command -v "$candidate" 2>/dev/null) || continue
+  [ "$resolved" = "/usr/bin/python3" ] && [ "$(uname -s)" = "Darwin" ] && continue
+  version=$($RUN "$resolved" -c 'import sys; print(sys.version_info.major * 100 + sys.version_info.minor)' 2>/dev/null || echo 0)
+  if [ "$version" -ge 310 ] 2>/dev/null && [ "$version" -le 313 ] 2>/dev/null; then
+    PYTHON="$resolved"
+    break
   fi
 done
 
 if [ -z "$PYTHON" ]; then
-  printf '\\033[31m  Python 3.10 to 3.13 is needed and was not found.\\033[0m\\n'
   case "$(uname -s)" in
     Darwin)
+      if [ -n "$RUN" ]; then
+        printf '\\033[31m  An Apple Silicon (arm64) Python 3.10 to 3.13 is needed and was not found.\\033[0m\\n'
+        printf '\\033[90m  An Intel Python runs under Rosetta, where PyTorch has no builds.\\033[0m\\n'
+      else
+        printf '\\033[31m  Python 3.10 to 3.13 is needed and was not found.\\033[0m\\n'
+      fi
       printf '\\033[33m    brew install python@3.12\\033[0m\\n'
-      printf '\\033[90m    (or the macOS installer from https://www.python.org/downloads/; the built-in python3 is too old)\\033[0m\\n' ;;
+      printf '\\033[90m    (no Homebrew? https://brew.sh, or the macOS installer from https://www.python.org/downloads/)\\033[0m\\n' ;;
     *)
+      printf '\\033[31m  Python 3.10 to 3.13 is needed and was not found.\\033[0m\\n'
       printf '\\033[33m    Ubuntu/Debian:  sudo apt install python3.12 python3.12-venv\\033[0m\\n'
       printf '\\033[33m    Fedora:         sudo dnf install python3.12\\033[0m\\n' ;;
   esac
@@ -223,8 +244,9 @@ done
 # --- Install and join ---------------------------------------------------------
 # setup_env.py detects the GPU (NVIDIA, Intel Arc, Apple Silicon or CPU-only),
 # installs the matching PyTorch build into $AGENT_ROOT/.venv, verifies a kernel
-# actually runs on it, and starts the worker. Safe to run again.
-exec "$PYTHON" "$AGENT_ROOT/setup_env.py" agent \\
+# actually runs on it, and starts the worker. Safe to run again. On Apple
+# Silicon it starts as arm64, so everything it launches is native too.
+exec $RUN "$PYTHON" "$AGENT_ROOT/setup_env.py" agent \\
   --server "$MESH_COORDINATOR" \\
   --token "$MESH_TOKEN" \\
   --name "$(hostname)"

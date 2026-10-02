@@ -8,12 +8,13 @@
 Licensed under **Creative Commons Attribution-NonCommercial 4.0**
 (CC BY-NC 4.0, <http://creativecommons.org/licenses/by-nc/4.0/>).
 
-- **Attribution** is shown on the training screen, linked to the source, and
-  recorded here.
+- **Attribution** is shown on the training screen and in the landing page's
+  footer, linked to the source, and recorded here.
 - **NonCommercial.** The model may be used in this research project and its
   publications. It may **not** ship in a commercial product or service. If
   GradMesh is ever used commercially, replace this file with a model whose
   licence allows it (see README.md in this folder for what the scene expects).
 
-Unmodified. The training screen recolours its black material at runtime to
-show the run state, and animates its parts; the file itself is as downloaded.
+Unmodified. The landing page and the training screen recolour its black
+material at runtime (the training screen by run state) and animate its parts;
+the file itself is as downloaded.

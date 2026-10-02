@@ -72,6 +72,26 @@
   border-top: 1px solid var(--line);
 }
 
+.dash-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  transition: background 0.15s ease;
+}
+
+.dash-stack .mono {
+  font-size: 0.66rem;
+  color: var(--text-faint);
+}
+
+.dash-stack:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
 .dash-main {
   min-width: 0;
   display: flex;
@@ -171,28 +191,6 @@
 .node-name {
   font-weight: 560;
   letter-spacing: -0.012em;
-}
-
-.node-facts {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 9px 16px;
-  font-size: 0.81rem;
-}
-
-.node-fact {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.node-fact span:first-child {
-  color: var(--text-faint);
-}
-
-.node-fact span:last-child {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
 }
 
 /* ------------------------------------------------------------------ shards */

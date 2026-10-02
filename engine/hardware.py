@@ -30,7 +30,9 @@ and verified, and falls back to CPU if the runtime will not initialise.
 
 Apple. Apple Silicon runs the stock macOS wheel, which carries the Metal (MPS)
 backend. PyTorch 2.13 wheels require macOS 14. Intel Macs lost PyTorch support
-after 2.2, and nothing current installs there.
+after 2.2, and nothing current installs there. An Intel (x86_64) Python on an
+Apple Silicon Mac runs under Rosetta and reports itself as an Intel Mac, so it
+is told apart and given the fix (a native Python) rather than turned away.
 """
 
 from __future__ import annotations
@@ -65,6 +67,7 @@ class Gpu:
     compute_capability: Optional[float] = None
     driver: Optional[str] = None
     memory_mb: Optional[int] = None
+    cores: Optional[int] = None  # GPU cores, where the platform reports them (Apple)
 
 
 @dataclass
@@ -78,6 +81,9 @@ class HostFacts:
     ram_mb: Optional[int] = None
     gpus: List[Gpu] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    # True when this Python is an x86_64 build running under Rosetta on an
+    # Apple Silicon Mac: `arch` then says x86_64 although the chip is arm64.
+    translated: bool = False
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -154,6 +160,20 @@ def _ram_mb() -> Optional[int]:
     except Exception:
         return None
     return None
+
+
+def _sysctl_flag(name: str) -> bool:
+    return (_run(["sysctl", "-n", name]) or "").strip() == "1"
+
+
+def apple_silicon() -> bool:
+    """An Apple Silicon Mac, whatever architecture this Python was built for."""
+    return sys.platform == "darwin" and (_arch() == "arm64" or _sysctl_flag("hw.optional.arm64"))
+
+
+def under_rosetta() -> bool:
+    """This process is x86_64 code being translated on an Apple Silicon Mac."""
+    return sys.platform == "darwin" and (_sysctl_flag("sysctl.proc_translated") or (_arch() == "x86_64" and apple_silicon()))
 
 
 def _macos_version() -> str:
@@ -293,7 +313,13 @@ def _linux_display_devices() -> List[Gpu]:
     return gpus
 
 
-def _apple_gpus() -> List[Gpu]:
+def apple_gpu_name(name: str, cores: Optional[int]) -> str:
+    """'Apple M1, 8-core GPU': the M1 Air shipped with 7 and 8 GPU cores, and
+    the difference shows up in the throughput, so the name carries it."""
+    return "%s, %d-core GPU" % (name, cores) if cores else name
+
+
+def _apple_gpus(ram_mb: Optional[int] = None) -> List[Gpu]:
     raw = _run(["system_profiler", "SPDisplaysDataType", "-json"], timeout=20)
     if raw:
         try:
@@ -301,14 +327,29 @@ def _apple_gpus() -> List[Gpu]:
             gpus = []
             for index, entry in enumerate(entries):
                 name = entry.get("sppci_model") or entry.get("_name") or "Apple GPU"
-                gpus.append(Gpu(vendor=_vendor_from_name(name) if "apple" not in name.lower() else "apple", name=name, index=index))
+                if "apple" not in name.lower():
+                    gpus.append(Gpu(vendor=_vendor_from_name(name), name=name, index=index))
+                    continue
+                cores = _float(str(entry.get("sppci_cores") or ""))
+                gpus.append(
+                    Gpu(
+                        vendor="apple",
+                        name=apple_gpu_name(name, int(cores) if cores else None),
+                        index=index,
+                        # Unified memory: the GPU's pool is the machine's RAM.
+                        memory_mb=ram_mb,
+                        cores=int(cores) if cores else None,
+                    )
+                )
             if gpus:
                 return gpus
         except Exception:
             pass
-    if _arch() == "arm64":
-        chip = (_run(["sysctl", "-n", "machdep.cpu.brand_string"]) or "Apple Silicon").strip()
-        return [Gpu(vendor="apple", name=chip, index=0)]
+    if apple_silicon():
+        chip = (_run(["sysctl", "-n", "machdep.cpu.brand_string"]) or "").strip()
+        if not chip or "virtualapple" in chip.lower():  # what Rosetta reports
+            chip = "Apple Silicon"
+        return [Gpu(vendor="apple", name=chip, index=0, memory_mb=ram_mb)]
     return []
 
 
@@ -325,13 +366,17 @@ def detect() -> HostFacts:
         ram_mb=_ram_mb(),
     )
 
+    if os_name == "macos" and under_rosetta():
+        facts.translated = True
+        facts.notes.append("this Python is an Intel build running under Rosetta on Apple Silicon")
+
     nvidia = _nvidia_gpus()
     if os_name == "windows":
         listed = _windows_video_controllers()
     elif os_name == "linux":
         listed = _linux_display_devices()
     else:
-        listed = _apple_gpus()
+        listed = _apple_gpus(facts.ram_mb)
 
     if not nvidia and any(gpu.vendor == "nvidia" for gpu in listed):
         facts.notes.append("an NVIDIA GPU is present but nvidia-smi is not, so the driver is not installed")
@@ -543,6 +588,22 @@ def select_profile(facts: HostFacts, prefer: str = "auto") -> Profile:
 
     # --- Apple -------------------------------------------------------------
     if facts.os == "macos":
+        if facts.arch != "arm64" and facts.translated:
+            return Profile(
+                name="mps",
+                backend="mps",
+                requirements="requirements-mps.txt",
+                label="PyTorch macOS build (Metal)",
+                reason="Apple Silicon, but this Python is an Intel build running under Rosetta",
+                torch=REFERENCE_STACK["torch"],
+                gpu_name=(apple[0].name if apple else "Apple Silicon"),
+                blocked="This Mac has Apple Silicon, but the Python that ran this is an Intel (x86_64) build "
+                "running under Rosetta, and PyTorch publishes no Intel-Mac builds. The GPU is fine; the "
+                "Python is the wrong one.",
+                fix="Install the Apple Silicon Python with Homebrew (brew install python@3.12, which lives in "
+                "/opt/homebrew) or the python.org macOS installer, then run the join command again. If "
+                "Terminal itself is set to open using Rosetta, turn that off in its Get Info window first.",
+            )
         if facts.arch != "arm64":
             return _cpu(
                 "Intel Macs have no current PyTorch builds",
@@ -571,6 +632,7 @@ def select_profile(facts: HostFacts, prefer: str = "auto") -> Profile:
             reason="Apple Silicon (%s) trains on the Metal backend" % (apple[0].name if apple else facts.arch),
             torch=REFERENCE_STACK["torch"],
             gpu_name=(apple[0].name if apple else "Apple Silicon"),
+            warnings=_apple_warnings(facts),
         )
 
     # --- Explicit Intel request -------------------------------------------
@@ -618,6 +680,22 @@ def select_profile(facts: HostFacts, prefer: str = "auto") -> Profile:
             gpu=amd[0],
         )
     return _cpu("no supported GPU was detected")
+
+
+# An 8 GB Mac reports 8192 MB; leave room for rounding in what sysctl returns.
+SMALL_UNIFIED_MEMORY_MB = 8 * 1024 + 512
+
+
+def _apple_warnings(facts: HostFacts) -> List[str]:
+    """What a person should know before lending this Mac, from the facts alone."""
+    warnings: List[str] = []
+    if facts.ram_mb and facts.ram_mb <= SMALL_UNIFIED_MEMORY_MB:
+        warnings.append(
+            "%d GB of unified memory is shared by macOS, every open app and the GPU. GradMesh sizes this Mac's "
+            "batches to what Metal grants and stops training from paging to the SSD; quit browsers and other "
+            "large apps before a run." % round(facts.ram_mb / 1024)
+        )
+    return warnings
 
 
 def _intel_profile(gpus: List[Gpu]) -> Profile:
