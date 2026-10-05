@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from federated_training import (
     IMAGE_SUFFIXES,
     discover_yolo_split_dirs,
+    is_os_junk,
     write_data_yaml,
     _copy_split_pairs,
 )
@@ -60,7 +61,7 @@ def list_split_images(
     train_images = sorted(
         path
         for path in split_dirs["train_images"].rglob("*")
-        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES and not is_os_junk(path)
     )
 
     if manifest is not None and manifest.is_file():
@@ -79,7 +80,7 @@ def list_split_images(
         val_images = sorted(
             path
             for path in split_dirs["val_images"].rglob("*")
-            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES and not is_os_junk(path)
         )
     return {"dirs": split_dirs, "train": train_images, "val": val_images}
 
@@ -298,6 +299,60 @@ def _resolve_inside(base: Path, rel: str) -> Path:
     if os.path.commonpath([str(root), str(target)]) != str(root):
         raise ValueError("path escapes the dataset: %s" % rel)
     return target
+
+
+# Packaging a dataset that was not uploaded as a zip (a standard import, a
+# subset) writes a temporary archive as large as the dataset, so it is capped.
+PACKAGE_LIMIT_BYTES = 4 * 1024 ** 3
+
+
+def _split_pairs(listing: Dict[str, Any]):
+    """(split, image, arcname, label or None) for every image a download carries."""
+    dirs = listing["dirs"]
+    train_dir = Path(dirs["train_images"])
+    val_dir = Path(dirs["val_images"]) if dirs.get("val_images") else None
+    splits = [("train", train_dir, dirs.get("train_labels"), listing["train"])]
+    # Some standard configs use the training images for validation; ship them once.
+    if val_dir is not None and val_dir.resolve() != train_dir.resolve():
+        splits.append(("val", val_dir, dirs.get("val_labels"), listing["val"]))
+    for split, image_dir, label_dir, images in splits:
+        for image in images:
+            rel = Path(image).relative_to(image_dir)
+            label = Path(label_dir) / rel.with_suffix(".txt") if label_dir else None
+            yield split, Path(image), rel.as_posix(), label if label is not None and label.is_file() else None
+
+
+def package_size(listing: Dict[str, Any]) -> int:
+    total = 0
+    for _, image, _, label in _split_pairs(listing):
+        total += image.stat().st_size + (label.stat().st_size if label else 0)
+    return total
+
+
+def write_dataset_zip(listing: Dict[str, Any], class_names: List[str], destination: Path) -> int:
+    """The dataset as one YOLO-layout zip, the same shape the Datasets page accepts.
+
+    images/train, labels/train, images/val, labels/val and a data.yaml naming
+    the classes, so the archive can be uploaded to another mesh unchanged.
+    Stored, not deflated: the images are already compressed.
+    """
+    count = 0
+    has_val = False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for split, image, rel, label in _split_pairs(listing):
+            archive.write(image, "images/%s/%s" % (split, rel))
+            if label is not None:
+                archive.write(label, "labels/%s/%s" % (split, Path(rel).with_suffix(".txt").as_posix()))
+            has_val = has_val or split == "val"
+            count += 1
+        names = "\n".join("  %d: %s" % (index, name) for index, name in enumerate(class_names or ["object"]))
+        archive.writestr(
+            "data.yaml",
+            "path: .\ntrain: images/train\nval: %s\nnc: %d\nnames:\n%s\n"
+            % ("images/val" if has_val else "images/train", len(class_names or ["object"]), names),
+        )
+    return count
 
 
 def write_bundle(dirs: Dict[str, Any], files: Sequence[str], destination: Path) -> int:

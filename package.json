@@ -1,6 +1,6 @@
 {
   "name": "gradmesh",
-  "version": "5.1.0",
+  "version": "5.1.1",
   "private": true,
   "description": "Turn every NVIDIA, Intel and Apple GPU on your network into one training cluster.",
   "scripts": {

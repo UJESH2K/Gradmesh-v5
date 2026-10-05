@@ -16,6 +16,22 @@ except Exception:  # pragma: no cover - optional dependency for syntax/runtime f
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
+def is_os_junk(path) -> bool:
+    """Files an operating system adds that are not part of the dataset.
+
+    A zip made with Finder's Compress carries a __MACOSX folder that mirrors the
+    whole tree with "._name.jpg" resource-fork files. They have image suffixes
+    but are not images, and the mirror has its own images/train folder, so left
+    in they can be mistaken for the training set. .DS_Store and Thumbs.db are
+    the folder-view files macOS and Windows leave behind.
+    """
+    parts = Path(path).parts
+    if any(part == "__MACOSX" for part in parts):
+        return True
+    name = parts[-1] if parts else ""
+    return name.startswith("._") or name in {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+
 def _normalize_zip_path(data: str) -> bytes:
     payload = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
     return base64.b64decode(payload.encode("ascii"))
@@ -37,14 +53,16 @@ def extract_zip_bytes(zip_bytes: bytes, destination: Path) -> Path:
 
 
 def _find_dir_with_suffix(root: Path, suffix_parts: tuple[str, str]) -> Optional[Path]:
-    for candidate in root.rglob("*"):
-        if candidate.is_dir() and tuple(candidate.parts[-2:]) == suffix_parts:
+    for candidate in sorted(root.rglob("*")):
+        if candidate.is_dir() and tuple(candidate.parts[-2:]) == suffix_parts and not is_os_junk(candidate):
             return candidate
     return None
 
 
 def discover_yolo_dataset_root(dataset_root: Path) -> Path:
-    candidates = list(dataset_root.iterdir())
+    # A single top-level folder is the dataset itself, as in "Strawberry/" plus
+    # the __MACOSX folder Finder adds next to it.
+    candidates = [path for path in dataset_root.iterdir() if not is_os_junk(path)]
     if len(candidates) == 1 and candidates[0].is_dir():
         return candidates[0]
     return dataset_root

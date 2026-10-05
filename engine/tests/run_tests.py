@@ -524,6 +524,64 @@ def shards_are_planned_as_lists_without_copying_images():
 
 
 @test
+def a_dataset_zipped_by_macos_finder_uses_the_real_images_not_the_resource_forks():
+    from coordinator import sharding
+    from federated_training import is_os_junk
+
+    for junk in ("__MACOSX/dataset/images/train/._a.jpg", "dataset/images/train/._a.jpg", "dataset/.DS_Store"):
+        assert is_os_junk(junk), junk
+    assert not is_os_junk("dataset/images/train/a.jpg")
+
+    # Finder's Compress puts a mirror of "._" files under __MACOSX next to the
+    # folder. A lowercase folder name sorts after "__MACOSX", which is the case
+    # that used to pick the mirror as the training set.
+    root = Path(tempfile.mkdtemp(prefix="gradmesh-mac-"))
+    _toy_dataset(root / "dataset")
+    for index in range(5):
+        for kind, suffix in (("images", ".jpg"), ("labels", ".txt")):
+            junk = root / "__MACOSX" / "dataset" / kind / "train" / ("._img%d%s" % (index, suffix))
+            junk.parent.mkdir(parents=True, exist_ok=True)
+            junk.write_bytes(b"\x00\x05\x16\x07 AppleDouble")
+    (root / "dataset" / ".DS_Store").write_bytes(b"\x00")
+    listing = sharding.list_split_images(root)
+    assert "__MACOSX" not in str(listing["dirs"]["train_images"]), listing["dirs"]
+    assert [path.name for path in listing["train"]] == ["img%d.jpg" % index for index in range(5)], listing["train"]
+
+
+@test
+def a_dataset_downloads_as_a_zip_the_datasets_page_accepts():
+    import zipfile
+    from coordinator import sharding
+
+    root = Path(tempfile.mkdtemp(prefix="gradmesh-dl-"))
+    _toy_dataset(root)
+    for index in range(2):
+        image = root / "images" / "val" / ("v%d.jpg" % index)
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"\xff\xd8" + bytes([index]) * 50)
+        label = root / "labels" / "val" / ("v%d.txt" % index)
+        label.parent.mkdir(parents=True, exist_ok=True)
+        label.write_text("1 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+    listing = sharding.list_split_images(root)
+    assert sharding.package_size(listing) > 0
+    target = root.parent / ("%s.zip" % root.name)
+    count = sharding.write_dataset_zip(listing, ["berry", "leaf"], target)
+    assert count == 7, count
+    with zipfile.ZipFile(target) as archive:
+        assert archive.testzip() is None
+        names = set(archive.namelist())
+        assert {"images/train/img0.jpg", "labels/train/img0.txt", "images/val/v1.jpg", "labels/val/v1.txt",
+                "data.yaml"} <= names, names
+        assert "labels/train/img2.txt" not in names  # a background image has no label
+        assert "0: berry" in archive.read("data.yaml").decode() and "val: images/val" in archive.read("data.yaml").decode()
+    # And it reads back as the same dataset.
+    again = root.parent / (root.name + "-again")
+    with zipfile.ZipFile(target) as archive:
+        archive.extractall(again)
+    assert len(sharding.list_split_images(again)["train"]) == 5
+
+
+@test
 def bundles_carry_labels_and_refuse_paths_outside_the_dataset():
     import zipfile
     from coordinator import sharding

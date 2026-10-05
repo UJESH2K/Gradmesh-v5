@@ -8,7 +8,7 @@ told to rejoin from the host's join page rather than half working.
 Stdlib only. The join flow imports this before any dependency is installed.
 """
 
-__version__ = "5.1.0"
+__version__ = "5.1.1"
 
 # 5: binary weight transfer, image-cache shards, phase timings, instance ids.
 PROTOCOL = 5

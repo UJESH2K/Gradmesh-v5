@@ -1,5 +1,26 @@
 # Changelog
 
+## 5.1.1
+
+Datasets from a Mac, and v5 as the running version.
+
+- **Download any dataset from the dashboard.** Each row on the Datasets page
+  has a Download button. An uploaded dataset comes back as the zip that was
+  uploaded; a standard import or a subset is packaged on demand (up to 4 GB)
+  in the same layout the page accepts, with a `data.yaml`. The file streams
+  through the dashboard's own address, so it works from any machine on the
+  Wi-Fi, not only the host.
+- **Upload a folder.** Safari unzips what it downloads, so on a Mac a dataset
+  is usually a folder. The Datasets page now takes a folder (drop it, or
+  *Choose a folder instead*) and zips it in the browser before uploading
+  (`lib/zip.ts`: stored entries, ZIP64 past 4 GB or 65,535 files).
+- **Zips made by macOS Finder work.** *Compress* adds a `__MACOSX` mirror of
+  `._name.jpg` files with image suffixes; for a folder whose name sorts after
+  it, the coordinator used to take that mirror as the training set. It is now
+  never extracted or listed, along with `.DS_Store` and `Thumbs.db`.
+- The host's state moves from v4 by copying `.gradmesh` (accounts, mesh token,
+  datasets, models, runs); v5 remaps v4's absolute paths.
+
 ## 5.1.0
 
 Ready for the Apple test machine, an 8 GB MacBook Air M1. The software each

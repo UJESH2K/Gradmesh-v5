@@ -39,6 +39,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -75,6 +76,7 @@ from coordinator import (
 from coordinator.events import bus
 from coordinator.health import health_warnings
 from coordinator.software import software_view
+from federated_training import is_os_junk
 from version import PROTOCOL, REFERENCE_STACK, __version__
 
 from coordinator.scheduler import (
@@ -2505,14 +2507,70 @@ async def upload_dataset(
 
 
 def _safe_extract(archive: zipfile.ZipFile, destination: Path) -> None:
-    """Reject archives that try to escape the extraction root."""
+    """Reject archives that try to escape the extraction root, and skip OS junk.
+
+    A zip made on a Mac carries a __MACOSX mirror of "._name.jpg" files, which
+    is never extracted (see federated_training.is_os_junk).
+    """
     destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()
+    members = []
     for member in archive.infolist():
         target = (root / member.filename).resolve()
         if not str(target).startswith(str(root)):
             raise ValueError("archive contains a path outside the extraction root")
-    archive.extractall(root)
+        if not is_os_junk(member.filename):
+            members.append(member)
+    archive.extractall(root, members=members)
+
+
+@app.get("/datasets/{dataset_id}/download")
+def download_dataset(dataset_id: str, _: str = Depends(require_mesh_token)):
+    """The dataset as a zip, for whoever is looking at the dashboard.
+
+    An uploaded dataset is returned as the archive that was uploaded. Anything
+    else (a standard import, a subset) is packaged on demand into the layout the
+    Datasets page accepts, up to sharding.PACKAGE_LIMIT_BYTES.
+    """
+    dataset = store.get_dataset(dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Unknown dataset")
+    if not dataset.get("available"):
+        raise HTTPException(status_code=410, detail="This dataset's files are not on the host any more")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", str(dataset.get("name") or dataset_id)).strip("-.") or dataset_id
+    archive = dataset.get("archive_path")
+    if archive and Path(archive).is_file() and not dataset.get("manifest_path"):
+        return FileResponse(archive, media_type="application/zip", filename="%s.zip" % stem)
+
+    manifest = dataset.get("manifest_path")
+    listing = sharding.list_split_images(
+        Path(dataset["extracted_path"]), Path(manifest) if manifest else None, splits=dataset.get("splits")
+    )
+    size = sharding.package_size(listing)
+    if size > sharding.PACKAGE_LIMIT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="This dataset is %.1f GB, too large to package for download (the limit is %.0f GB). Copy it "
+            "from %s on the host instead." % (size / 1024 ** 3, sharding.PACKAGE_LIMIT_BYTES / 1024 ** 3,
+                                              dataset["extracted_path"]),
+        )
+    import tempfile
+
+    if shutil.disk_usage(tempfile.gettempdir()).free < size * 1.2 + 256 * 1024 ** 2:
+        raise HTTPException(status_code=507, detail="The host does not have enough free disk to package this dataset.")
+    handle, temp_path = tempfile.mkstemp(suffix=".zip", prefix="gradmesh-dataset-")
+    os.close(handle)
+    try:
+        sharding.write_dataset_zip(listing, list(dataset.get("class_names") or []), Path(temp_path))
+    except Exception:
+        Path(temp_path).unlink(missing_ok=True)
+        raise
+    return FileResponse(
+        temp_path,
+        media_type="application/zip",
+        filename="%s.zip" % stem,
+        background=BackgroundTask(lambda: Path(temp_path).unlink(missing_ok=True)),
+    )
 
 
 @app.post("/datasets/{dataset_id}/default")

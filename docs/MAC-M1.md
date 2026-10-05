@@ -133,6 +133,26 @@ Checklist, in order:
       1x.x, with the green **reference stack** badge.
 - [ ] If macOS asks whether Python may accept incoming connections, either
       answer works: the worker only makes outgoing connections.
+- [ ] If macOS asks whether **Terminal** may find and connect to devices on
+      your local network, choose **Allow**. Without it (macOS 15 Sequoia and
+      later), the Mac cannot reach the host at all. If you already denied it:
+      System Settings > Privacy & Security > Local Network > Terminal on.
+
+### Datasets and the Mac
+
+The Mac does not need a dataset to contribute. The host owns the datasets,
+and each round the worker downloads only the images in its slice and caches
+them under `~/.gradmesh/cache`.
+
+To move a dataset onto or off the Mac anyway, use the dashboard from Safari on
+the Mac:
+
+- **Download:** Datasets > Download on any row gives a zip in the layout the
+  page accepts. Safari unzips it into a folder by default.
+- **Upload:** drop the dataset folder onto the Datasets page, or use *Choose a
+  folder instead*. It is zipped in the browser and uploaded. A zip works as
+  well, including one made with Finder's *Compress*: its `__MACOSX` folder is
+  ignored.
 
 ### Run settings that suit this Mac
 
@@ -159,6 +179,8 @@ Checklist, in order:
 | `PyTorch 2.13.0 needs macOS 14 Sonoma or newer` | Older macOS | Update macOS |
 | `the Metal backend is not available` | Older macOS, or a damaged environment | Update macOS, then rejoin with `--force`: `/opt/homebrew/bin/python3.12 ~/.gradmesh/agent/setup_env.py agent --server http://HOST_IP:8000 --token TOKEN --force` |
 | A dialog asks to install the command line developer tools | Something ran `/usr/bin/python3` | Cancel it. The join script never runs that path. |
+| `curl: (7) Failed to connect ... No route to host` while the host is up | Terminal was denied Local Network access (macOS 15+) | System Settings > Privacy & Security > Local Network > Terminal on, then rerun |
+| The dashboard only accepts a zip, but the download became a folder | Safari unzips downloads | Drop the folder, or use *Choose a folder instead* (5.1.1) |
 | `out of memory (Metal, unified memory shared with macOS and open apps)` | The batch did not fit beside the other apps | Automatic: the next round's batch is halved. Quit other apps. |
 | Card: `macOS reports a serious thermal state` | The fanless Mac is hot and slowing down | Airflow: lid open, hard surface, stand, cooler room. A smaller image size also helps. |
 | Card: `Low Power Mode is on` | | System Settings > Battery |
@@ -187,6 +209,12 @@ worker's terminal (`round N shard M: K images, batch B`).
 ---
 
 ## 7. Changes made for this machine
+
+- **5.1.1 (5 October 2026):**
+  - Datasets can be downloaded from the dashboard on any machine.
+  - Folders can be uploaded, and are zipped in the browser.
+  - Zips made by Finder (with `__MACOSX`) register the real images.
+  - The host now runs v5, with v4's state carried over.
 
 - **5.1.0 (2 October 2026):**
   - Rosetta detection, with a native relaunch in setup and arm64-only Python

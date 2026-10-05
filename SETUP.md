@@ -296,6 +296,8 @@ Run `npm run doctor` first. The usual causes, by symptom:
 | MPS unavailable on a Mac | macOS older than 14 | update macOS |
 | `the Python that ran this is an Intel (x86_64) build` on a Mac | an Intel Python under Rosetta, with no native one installed | `brew install python@3.12`, rerun the join command |
 | `out of memory (Metal, unified memory ...)` | an 8 GB Mac with other apps holding memory | automatic: the batch halves next round; quit other apps |
+| a Mac cannot reach the host (`No route to host`) although other machines can | macOS 15+ Local Network permission denied for Terminal | System Settings > Privacy & Security > Local Network > Terminal |
+| a dataset downloaded on a Mac is a folder, not a zip | Safari unzips downloads | drop the folder on the Datasets page; it is zipped in the browser |
 | a Mac's rate drops after a few rounds; card says *serious thermal state* | a fanless MacBook Air slowing down to cool | airflow (lid open, hard surface, stand); the scheduler adapts either way |
 | the environment "will not start" / rebuilt on every run | it was synced from another machine | nothing; v5 rebuilds it machine-locally once |
 | `next dev` fails with a missing `@next/swc-...` | `node_modules` from another OS | delete `node_modules`, `npm install` |
